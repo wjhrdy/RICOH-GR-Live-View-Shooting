@@ -1,11 +1,14 @@
 #include "gr_api.h"
 
+#include <cstring>
+
 #include "config.h"
 
 namespace {
 constexpr uint32_t kDefaultConnectTimeoutMs = 5000;
 constexpr uint32_t kHeaderMaxBytes = 2048;
 constexpr uint32_t kPropsBodyMaxBytes = 16 * 1024;
+constexpr uint32_t kCommandBodyMaxBytes = 4096;
 
 String lowerCopy(String value) {
   value.toLowerCase();
@@ -161,27 +164,283 @@ bool GrApi::fetchProps(CameraProps& props, uint32_t timeoutMs) {
 }
 
 
-bool GrApi::openLiveView() {
-  closeLiveView();
+bool GrApi::sendForm(const char* method, const char* path, const char* body, uint32_t timeoutMs) {
+  if (method == nullptr || (strcmp(method, "POST") != 0 && strcmp(method, "PUT") != 0)) {
+    setError("Invalid HTTP method");
+    return false;
+  }
+  if (path == nullptr || path[0] != '/') {
+    setError("Invalid HTTP path");
+    return false;
+  }
 
-  if (!connectClient(_liveClient, kDefaultConnectTimeoutMs)) {
+  WiFiClient client;
+  if (!connectClient(client, timeoutMs)) {
     return false;
   }
 
   const String host = _host.length() ? _host : String(GR_HOST);
-  _liveClient.print(String("GET /v1/liveview HTTP/1.1\r\nHost: ") + host +
+  const size_t bodyLen = body != nullptr ? strlen(body) : 0;
+  String request = String(method) + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\n";
+  if (bodyLen > 0) {
+    request += "Content-Type: application/x-www-form-urlencoded\r\n";
+  }
+  request += "Content-Length: " + String(static_cast<unsigned>(bodyLen)) +
+             "\r\nConnection: close\r\n\r\n";
+  client.print(request);
+  if (bodyLen > 0) {
+    client.print(body);
+  }
+
+  String headers;
+  if (!readHttpHeaders(client, timeoutMs, headers)) {
+    setError(String("Timed out reading ") + path + " response");
+    client.stop();
+    return false;
+  }
+
+  const int status = parseHttpStatus(headers);
+  if (status < 200 || status >= 300) {
+    client.stop();
+    setError(String(method) + " " + path + " HTTP " + status);
+    return false;
+  }
+
+  String responseBody;
+  const int contentLength = parseContentLength(headers);
+  if (contentLength > static_cast<int>(kCommandBodyMaxBytes)) {
+    client.stop();
+    setError(String(method) + " " + path + " response too large");
+    return false;
+  }
+  if (contentLength > 0) {
+    responseBody.reserve(contentLength + 1);
+  }
+
+  const uint32_t startedAt = millis();
+  while (contentLength != 0 && (client.connected() || client.available())) {
+    while (client.available()) {
+      responseBody += static_cast<char>(client.read());
+      if (responseBody.length() > kCommandBodyMaxBytes) {
+        client.stop();
+        setError(String(method) + " " + path + " response too large");
+        return false;
+      }
+      if (contentLength >= 0 && responseBody.length() >= contentLength) {
+        break;
+      }
+    }
+    if (contentLength >= 0 && responseBody.length() >= contentLength) {
+      break;
+    }
+    if (millis() - startedAt > timeoutMs) {
+      client.stop();
+      setError(String("Timed out reading ") + path + " body");
+      return false;
+    }
+    yield();
+    delay(1);
+  }
+  client.stop();
+
+  if (!ricohHttpJsonSucceeded(responseBody.c_str())) {
+    setError(String(method) + " " + path + " " + responseBody);
+    return false;
+  }
+
+  _lastError = "";
+  return true;
+}
+
+bool GrApi::postForm(const char* path, const char* body, uint32_t timeoutMs) {
+  return sendForm("POST", path, body, timeoutMs);
+}
+
+bool GrApi::shoot(uint32_t timeoutMs) {
+  char body[24];
+  if (!formatLiveviewShootAfOnBody(body, sizeof(body))) {
+    setError("Invalid shoot AF body");
+    return false;
+  }
+  return postForm("/v1/camera/shoot", body, timeoutMs);
+}
+
+bool GrApi::setFocusSetting(const char* setting, uint32_t timeoutMs) {
+  char body[48];
+  if (!formatLiveviewFocusSettingBody(body, sizeof(body), setting)) {
+    setError("Invalid focusSetting");
+    return false;
+  }
+  return sendForm("PUT", "/v1/params/lens", body, timeoutMs);
+}
+
+bool GrApi::postCommand(const char* path, uint32_t timeoutMs, String& responseBody) {
+  responseBody = "";
+  if (path == nullptr || path[0] != '/') {
+    setError("Invalid GR II command path");
+    return false;
+  }
+
+  WiFiClient client;
+  if (!connectClient(client, timeoutMs)) {
+    return false;
+  }
+
+  const String host = _host.length() ? _host : String(GR_HOST);
+  client.print(String("POST ") + path + " HTTP/1.1\r\nHost: " + host +
+               "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+  String headers;
+  if (!readHttpHeaders(client, timeoutMs, headers)) {
+    client.stop();
+    setError(String("Timed out reading ") + path + " response");
+    return false;
+  }
+
+  const int status = parseHttpStatus(headers);
+  if (status < 200 || status >= 300) {
+    client.stop();
+    setError(String("POST ") + path + " HTTP " + status);
+    return false;
+  }
+
+  const int contentLength = parseContentLength(headers);
+  if (contentLength > static_cast<int>(kCommandBodyMaxBytes)) {
+    client.stop();
+    setError(String("POST ") + path + " response too large");
+    return false;
+  }
+  if (contentLength == 0) {
+    client.stop();
+    _lastError = "";
+    return true;
+  }
+  if (contentLength > 0) {
+    responseBody.reserve(contentLength + 1);
+  }
+
+  const uint32_t startedAt = millis();
+  while (client.connected() || client.available()) {
+    while (client.available()) {
+      responseBody += static_cast<char>(client.read());
+      if (responseBody.length() > kCommandBodyMaxBytes) {
+        client.stop();
+        setError(String("POST ") + path + " response too large");
+        return false;
+      }
+      if (contentLength >= 0 && responseBody.length() >= contentLength) {
+        client.stop();
+        _lastError = "";
+        return true;
+      }
+    }
+    if (millis() - startedAt > timeoutMs) {
+      client.stop();
+      setError(String("Timed out reading ") + path + " body");
+      return false;
+    }
+    yield();
+    delay(1);
+  }
+
+  client.stop();
+  _lastError = "";
+  return true;
+}
+
+bool GrApi::finishWlan(uint32_t timeoutMs) {
+  closeLiveView();
+
+  WiFiClient client;
+  if (!connectClient(client, timeoutMs)) {
+    return false;
+  }
+
+  const String host = _host.length() ? _host : String(GR_HOST);
+  const String request = String("POST /v1/device/wlan/finish HTTP/1.1\r\nHost: ") + host +
+                         "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+  const size_t written = client.print(request);
+  if (written != request.length()) {
+    client.stop();
+    setError("POST /v1/device/wlan/finish request incomplete");
+    return false;
+  }
+
+  // Give the TCP stack and camera a bounded window to consume the request.
+  // Do not wait for headers: successful shutdown commonly drops this same
+  // connection before a complete HTTP response is returned.
+  const uint32_t settleMs = timeoutMs < 250 ? timeoutMs : 250;
+  const uint32_t startedAt = millis();
+  while (client.connected() && millis() - startedAt < settleMs) {
+    yield();
+    delay(10);
+  }
+  client.stop();
+  _lastError = "";
+  return true;
+}
+
+
+void GrApi::setLiveViewMaxFps(uint8_t fps) {
+  _liveViewMaxFps = fps;
+}
+
+void GrApi::setLiveViewResolution(const LiveViewResolution& resolution) {
+  _liveViewResolution = resolution;
+}
+
+int GrApi::requestLiveView(bool includeResolution) {
+  if (!connectClient(_liveClient, kDefaultConnectTimeoutMs)) {
+    return -1;
+  }
+
+  const String host = _host.length() ? _host : String(GR_HOST);
+  String query;
+  if (_liveViewMaxFps > 0) {
+    query += String("maxfps=") + _liveViewMaxFps;
+  }
+  if (includeResolution) {
+    if (query.length() > 0) {
+      query += '&';
+    }
+    query += String("reso=") + _liveViewResolution.width + "x" + _liveViewResolution.height;
+  }
+  String path = "/v1/liveview";
+  if (query.length() > 0) {
+    path += '?';
+    path += query;
+  }
+  Serial.printf("HTTP: opening LiveView path=%s\n", path.c_str());
+  _liveClient.print(String("GET ") + path + " HTTP/1.1\r\nHost: " + host +
                     "\r\nConnection: keep-alive\r\n\r\n");
 
   String headers;
   if (!readHttpHeaders(_liveClient, kDefaultConnectTimeoutMs, headers)) {
     _liveClient.stop();
-    return false;
+    return -1;
   }
-
   const int status = parseHttpStatus(headers);
   if (status != 200) {
     _liveClient.stop();
     setError(String("GET /v1/liveview HTTP ") + status);
+  }
+  return status;
+}
+
+bool GrApi::openLiveView() {
+  closeLiveView();
+
+  const bool withResolution = _liveViewResolution.valid();
+  int status = requestLiveView(withResolution);
+  if (withResolution && status >= 400 && status < 500) {
+    Serial.printf("HTTP: LiveView rejected reso=%ux%u (HTTP %d); using camera default\n",
+                  static_cast<unsigned>(_liveViewResolution.width),
+                  static_cast<unsigned>(_liveViewResolution.height),
+                  status);
+    _liveViewResolution = LiveViewResolution{};
+    status = requestLiveView(false);
+  }
+  if (status != 200) {
     return false;
   }
 
@@ -324,6 +583,12 @@ void GrApi::parsePropsJson(const String& json, CameraProps& props) const {
       extractJsonString(json, "battery", stringValue)) {
     batteryState = stringValue;
   }
+
+  if (extractJsonString(json, "focusSetting", stringValue)) {
+    props.focusSetting = stringValue;
+  }
+
+  props.resoCount = parseLiveViewResoList(json.c_str(), props.resoList, LIVEVIEW_RESO_LIST_CAPACITY);
 
   if (props.model.isEmpty()) {
     props.model = "RICOH GR";

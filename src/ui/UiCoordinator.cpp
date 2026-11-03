@@ -1,0 +1,182 @@
+#include "UiCoordinator.h"
+
+#include <algorithm>
+
+#include "UiTheme.h"
+
+namespace rvf {
+
+void UiCoordinator::begin(uint32_t nowMs) {
+    _view = UiViewModel{};
+    _lastScene = UiScene::Boot;
+    _sceneChangedAtMs = nowMs;
+    _focusTickPlayed = false;
+    _shutterPreparing = false;
+    _lastFocusTickAtMs = nowMs;
+    _shutterOverlay.stop();
+    _resetSplit.stop();
+    _wakePulse.stop();
+    _pendingSound = UiSound::None;
+}
+
+UiScene UiCoordinator::selectScene(const UiSnapshot& snapshot,
+                                   UiOrientation orientation,
+                                   bool resetVisualActive) {
+    const CameraPhase phase = snapshot.cameraPhase;
+    if (phase == CameraPhase::Error) return UiScene::Error;
+    if (snapshot.resettingPairing || resetVisualActive) return UiScene::ResetPairing;
+    if (snapshot.wifiProvisioningActive) return UiScene::WifiProvisioning;
+    if (snapshot.pairingGuideActive) return UiScene::PairingGuide;
+    if (snapshot.cameraSleepLike || phase == CameraPhase::Sleeping) return UiScene::CameraSleep;
+    if (phase == CameraPhase::Booting) return UiScene::Boot;
+    if (phase == CameraPhase::Searching) return UiScene::Pairing;
+    if (phase == CameraPhase::Connecting) return UiScene::Connecting;
+    if (snapshot.previewRunning || phase == CameraPhase::Previewing) {
+        return orientation == UiOrientation::Landscape ? UiScene::LivePreview : UiScene::RemoteReady;
+    }
+    if (snapshot.bleConnected || snapshot.shutterReady || phase == CameraPhase::Ready) {
+        return UiScene::RemoteReady;
+    }
+    return UiScene::Disconnected;
+}
+
+UiOrientation UiCoordinator::resolvePreviewOrientation(UiOrientation sensedOrientation,
+                                                       bool liveViewLocked) {
+    return liveViewLocked ? UiOrientation::Landscape : sensedOrientation;
+}
+
+UiOrientation UiCoordinator::desiredOrientation(UiScene scene, UiOrientation sensed) {
+    if (scene == UiScene::LivePreview) return UiOrientation::Landscape;
+    if (scene == UiScene::ResetPairing) return sensed;
+    return UiOrientation::Portrait;
+}
+
+void UiCoordinator::requestSound(UiSound sound) {
+    if (_pendingSound == UiSound::None) _pendingSound = sound;
+}
+
+UiSound UiCoordinator::consumeSound() {
+    const UiSound sound = _pendingSound;
+    _pendingSound = UiSound::None;
+    return sound;
+}
+
+void UiCoordinator::notifyShutterStarted(uint32_t) {
+    _shutterPreparing = true;
+}
+
+void UiCoordinator::notifyShutterResult(bool success, uint32_t nowMs) {
+    _shutterPreparing = false;
+    const uint32_t duration = _view.orientation == UiOrientation::Landscape
+                                  ? UiTheme::kLandscapeShutterCurtainMs
+                                  : UiTheme::kPortraitShutterFlashMs;
+    _shutterOverlay.start(nowMs, duration);
+    _view.shutterFailed = !success;
+    requestSound(success ? UiSound::ShutterClick : UiSound::Error);
+}
+
+void UiCoordinator::notifyResetTriggered(uint32_t nowMs) {
+    _resetSplit.start(nowMs, UiTheme::kResetSplitMs);
+}
+
+void UiCoordinator::notifyManualWake(uint32_t nowMs) {
+    _wakePulse.start(nowMs, UiTheme::kWakeBrightenDurationMs);
+    requestSound(UiSound::Success);
+}
+
+void UiCoordinator::update(const UiSnapshot& snapshot,
+                           const ButtonEvents& input,
+                           UiOrientation sensedOrientation,
+                           uint32_t nowMs) {
+    if (input.buttonADown) {
+        _focusTickPlayed = false;
+        _lastFocusTickAtMs = nowMs;
+    }
+    _view.focusActive = input.buttonAHeld || _shutterPreparing;
+    if (input.buttonAHeld && input.buttonAHoldMs >= UiTheme::kFocusHoldThresholdMs) {
+        const uint32_t focusElapsed = input.buttonAHoldMs - UiTheme::kFocusHoldThresholdMs;
+        _view.focusProgress = uiSmoothStep(
+            static_cast<float>(focusElapsed) / static_cast<float>(UiTheme::kFocusTransitionMs));
+        if (!_focusTickPlayed || uiElapsedMs(nowMs, _lastFocusTickAtMs) >= UiTheme::kFocusTickIntervalMs) {
+            requestSound(UiSound::FocusTick);
+            _focusTickPlayed = true;
+            _lastFocusTickAtMs = nowMs;
+        }
+    } else {
+        _view.focusProgress = _shutterPreparing ? 1.0f : 0.0f;
+    }
+    if (input.buttonAReleased) {
+        _view.focusActive = _shutterPreparing;
+        _view.focusProgress = _shutterPreparing ? 1.0f : 0.0f;
+    }
+
+    if (input.resetPairing) notifyResetTriggered(nowMs);
+
+    _shutterOverlay.update(nowMs);
+    _resetSplit.update(nowMs);
+    _wakePulse.update(nowMs);
+
+    const bool resetVisualActive = input.resetHoldActive || _resetSplit.active;
+    const UiScene scene = selectScene(snapshot, sensedOrientation, resetVisualActive);
+    if (scene != _lastScene) {
+        _lastScene = scene;
+        _sceneChangedAtMs = nowMs;
+    }
+
+    _view.scene = scene;
+    _view.orientation = desiredOrientation(scene, sensedOrientation);
+    _view.nowMs = nowMs;
+    _view.resetProgress = input.resetHoldActive ? input.resetHoldProgress : 0.0f;
+    _view.resetSplitActive = _resetSplit.active;
+    _view.resetSplitProgress = _resetSplit.progress(nowMs);
+    _view.bleConnected = snapshot.bleConnected;
+    _view.pairingGuideSelectedIndex = snapshot.pairingGuideSelectedIndex;
+    _view.wifiProvisioningPreparing = snapshot.wifiProvisioningPreparing;
+    _view.provisioningSsid = snapshot.provisioningSsid;
+    _view.provisioningPassword = snapshot.provisioningPassword;
+    _view.provisioningUrl = snapshot.provisioningUrl;
+    _view.shutterOverlayActive = _shutterOverlay.active;
+    _view.overlayProgress = _shutterOverlay.progress(nowMs);
+    _view.hasFrame = snapshot.hasFrame;
+    _view.deviceBatteryPercent = snapshot.deviceBatteryPercent;
+    _view.deviceCharging = snapshot.deviceCharging;
+    _view.errorTitle = snapshot.errorTitle;
+    _view.errorDetail = snapshot.errorDetail;
+    _view.shouldRenderLivePreview = scene == UiScene::LivePreview && snapshot.previewRunning;
+
+    const uint32_t sceneElapsed = uiElapsedMs(nowMs, _sceneChangedAtMs);
+    if (scene == UiScene::Pairing || scene == UiScene::Connecting) {
+        if (!snapshot.bleConnected) {
+            const uint32_t cycleDuration = std::max<uint32_t>(UiTheme::kConnectMergeMs, 2U);
+            const uint32_t cycle = sceneElapsed % cycleDuration;
+            const uint32_t halfCycle = cycleDuration / 2U;
+            const float approach = cycle <= halfCycle
+                                       ? static_cast<float>(cycle) / static_cast<float>(halfCycle)
+                                       : static_cast<float>(cycleDuration - cycle) /
+                                             static_cast<float>(cycleDuration - halfCycle);
+            // Never reach the merge branch until the BLE link is authoritative.
+            _view.sceneProgress = 0.90f * uiSmoothStep(approach);
+        } else {
+            _view.sceneProgress = 1.0f;
+        }
+    } else if (scene == UiScene::Disconnected) {
+        _view.sceneProgress = uiEaseOut(static_cast<float>(sceneElapsed) /
+                                        static_cast<float>(UiTheme::kResetSplitMs));
+    } else if (scene == UiScene::Boot) {
+        const uint32_t cycle = sceneElapsed % 1000U;
+        const float triangular = cycle <= 500U ? static_cast<float>(cycle) / 500.0f
+                                               : static_cast<float>(1000U - cycle) / 500.0f;
+        _view.sceneProgress = uiSmoothStep(triangular);
+    } else {
+        _view.sceneProgress = 1.0f;
+    }
+
+    if (scene == UiScene::CameraSleep) {
+        _view.sleepProgress = uiSmoothStep(static_cast<float>(sceneElapsed) /
+                                           static_cast<float>(UiTheme::kSleepDimDurationMs));
+    } else {
+        _view.sleepProgress = 0.0f;
+    }
+}
+
+}  // namespace rvf

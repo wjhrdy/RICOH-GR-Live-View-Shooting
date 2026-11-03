@@ -18,6 +18,10 @@ public:
 
     Result begin();
     Result begin(RicohBleClient& client);
+    Result setSecurityProfile(RicohSecurityProfileId profile);
+    void setBindingState(CameraBindingState state);
+    CameraBindingState bindingState() const;
+    bool consumeBondInvalidRequest();
 
     Result scan();
     bool consumeEvent(AppMessage& message);
@@ -31,22 +35,38 @@ public:
     Result connectCamera(const RicohBleDeviceInfo& info, const RicohBleConnectOptions& options);
 
     void disconnect();
+    Result applyConnParams(const BleConnParams& params, const char* reason);
+    bool readConnParams(BleConnParams& params) const;
+    uint32_t peerConnParamRequests() const;
+    uint32_t connectionSerial() const;
     bool isConnected() const;
     bool shutterReady() const;
 
     Result shoot(bool autofocus = true);
-    Result openWifi();
+    Result openWifi(bool startupModeProbe = false);
+    Result closeWifi();
     Result readPowerState(RicohCameraPowerState& state);
     Result readOperationMode(RicohCameraOperationMode& mode);
+    Result requestCaptureOperationMode();
     Result enablePowerStateNotify();
     bool consumePowerOffNotification();
+    Result enableCameraStatusNotify();
+    bool statusNotifyAttempted() const;
+    uint32_t shotEventSequence() const;
+    bool shotNotifyActive() const;
+    int batteryLevel() const;
     Result waitForWifiCredentials(RicohBleWifiCredentials& credentials, uint32_t timeoutMs);
 
     int consumeDisconnectReason();
     void clearDisconnectReason();
     Result deleteAllBonds();
-    void resetStack(bool clearObjects = false);
+    Result resetStack(bool clearObjects = false);
     bool lastFailureWasResourceExhausted() const;
+    const CameraProtocolProfile& protocolProfile() const;
+    RicohBleSecurityState securityState() const;
+    String connectedIdentityAddress() const;
+    uint8_t connectedIdentityAddressType() const;
+    bool connectedIdentityKnown() const;
 
     String statusText() const;
     String lastError() const;

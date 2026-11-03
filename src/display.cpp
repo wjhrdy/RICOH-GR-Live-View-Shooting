@@ -1,443 +1,544 @@
 #include "display.h"
 
-namespace {
-constexpr uint16_t COLOR_WHITE = 0xFFFF;
-constexpr uint16_t COLOR_RED = 0xF800;
-constexpr uint16_t COLOR_GREEN = 0x07E0;
-constexpr uint16_t COLOR_YELLOW = 0xFFE0;
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
-// RICOH styling additions
-constexpr uint16_t COLOR_BG = 0x1082;     // Matte Charcoal Black (#121212)
-constexpr uint16_t COLOR_AMBER = 0xFD20;  // Signature Amber Orange (#FF9500)
-constexpr uint16_t COLOR_SLATE = 0x2104;  // Slate Gray (#212121)
-constexpr uint16_t COLOR_GRAY = 0x7BEF;   // Mid Gray (#7B7B7B)
-constexpr uint16_t COLOR_CARD = 0x0841;   // Deep black panel
-constexpr uint16_t COLOR_PANEL = 0x18E3;  // Dark graphite
-constexpr uint16_t COLOR_GRAPHITE = 0x31A6;
-constexpr uint16_t COLOR_DARK = 0x0000;
-constexpr uint16_t COLOR_HILITE = 0xE71C;
+#include <esp_heap_caps.h>
+
+#include "camera/CameraRegistry.h"
+#include "ui/UiTheme.h"
+
+namespace {
 
 const char* safeText(const char* value, const char* fallback = "") {
-    return value != nullptr ? value : fallback;
+    return value != nullptr && value[0] != '\0' ? value : fallback;
 }
 
-
-char upperAscii(char ch) {
-    return (ch >= 'a' && ch <= 'z') ? static_cast<char>(ch - ('a' - 'A')) : ch;
+uint16_t gray565(float intensity) {
+    const uint8_t five = static_cast<uint8_t>(rvf::uiClamp01(intensity) * 31.0f + 0.5f);
+    const uint8_t six = static_cast<uint8_t>(rvf::uiClamp01(intensity) * 63.0f + 0.5f);
+    return static_cast<uint16_t>((five << 11) | (six << 5) | five);
 }
-
-bool containsIgnoreCase(const char* value, const char* needle) {
-    if (needle == nullptr || needle[0] == '\0') {
-        return true;
-    }
-    if (value == nullptr || value[0] == '\0') {
-        return false;
-    }
-    for (const char* pos = value; *pos != '\0'; ++pos) {
-        const char* hay = pos;
-        const char* pat = needle;
-        while (*hay != '\0' && *pat != '\0' && upperAscii(*hay) == upperAscii(*pat)) {
-            ++hay;
-            ++pat;
-        }
-        if (*pat == '\0') {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool statusContains(const char* line1,
-                    const char* line2,
-                    const char* line3,
-                    const char* line4,
-                    const char* needle) {
-    return containsIgnoreCase(line1, needle) ||
-           containsIgnoreCase(line2, needle) ||
-           containsIgnoreCase(line3, needle) ||
-           containsIgnoreCase(line4, needle);
-}
-
 
 }  // namespace
 
 bool DisplayUi::begin() {
     auto cfg = M5.config();
     cfg.serial_baudrate = 115200;
+    cfg.output_power = false;
+    cfg.internal_imu = true;
+    cfg.internal_mic = false;
+    cfg.internal_rtc = false;
+    cfg.internal_spk = rvf::UiTheme::kSoundEnabled;
     M5.begin(cfg);
 
-    M5.Display.setRotation(1);
-    _width = M5.Display.width();
-    _height = M5.Display.height();
-
-    // StickS3 is physically 135x240; rotation 1/3 should expose landscape 240x135.
-    // If a board package reports the opposite, rotate once more to keep callers in landscape.
-    if (_width < _height) {
-        M5.Display.setRotation(3);
-        _width = M5.Display.width();
-        _height = M5.Display.height();
-    }
-
-    // Initialize Canvas sprite for double-buffered flicker-free rendering
-    _canvas.setColorDepth(16); // 16-bit RGB565
-    _canvas.createSprite(_width, _height);
-
-    clear(COLOR_BG);
-    _canvas.setTextSize(1);
-    _canvas.setTextWrap(false);
-
-    // Initial push to screen
+    _canvas.setColorDepth(16);
+    _canvasUsePsram = psramFound();
+    _canvas.setPsram(_canvasUsePsram);
+    Serial.printf("UI Canvas: storage=%s free_int=%lu largest_int=%lu free_psram=%lu largest_psram=%lu\n",
+                  _canvasUsePsram ? "psram" : "internal",
+                  static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+                  static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+    _backlight.begin(rvf::UiTheme::kActiveBrightness);
+    M5.Display.setBrightness(rvf::UiTheme::kActiveBrightness);
+    if (!createCanvasFor(rvf::UiOrientation::Portrait)) return false;
+    clear(rvf::UiTheme::kBlack);
     pushCanvas();
     return true;
 }
 
-void DisplayUi::showBoot(const char* message) {
-    clear(COLOR_BG);
+bool DisplayUi::createCanvasFor(rvf::UiOrientation orientation) {
+    const uint8_t primaryRotation = rvf::viewfinderRotation(orientation, viewfinderMode(), _selfie);
+    const uint8_t alternateRotation = (primaryRotation + 2) % 4;
+    M5.Display.setRotation(primaryRotation);
+    bool shapeMatches = orientation == rvf::UiOrientation::Portrait
+                            ? M5.Display.width() < M5.Display.height()
+                            : M5.Display.width() > M5.Display.height();
+    if (!shapeMatches) M5.Display.setRotation(alternateRotation);
 
-    // Outer card border (matching BLE status screen)
-    const int16_t x = 8;
-    const int16_t y = 6;
-    const int16_t w = _width - 16;
-    const int16_t h = _height - 12;
-    _canvas.fillRoundRect(x, y, w, h, 10, COLOR_CARD);
-    _canvas.drawRoundRect(x, y, w, h, 10, COLOR_GRAPHITE);
-    _canvas.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 8, COLOR_SLATE);
+    const int16_t width = M5.Display.width();
+    const int16_t height = M5.Display.height();
+    // Keep the always-on portrait UI in PSRAM, but use DMA-capable internal RAM
+    // for the short-lived landscape preview canvas. A full 240x135 RGB565 frame
+    // is 64.8 KiB and fits after Wi-Fi/BLE bring-up on StickS3.
+    _canvasUsePsram = orientation != rvf::UiOrientation::Landscape && psramFound();
+    _canvas.setPsram(_canvasUsePsram);
+    void* sprite = _canvas.createSprite(width, height);
+    if (sprite == nullptr && !_canvasUsePsram && psramFound()) {
+        Serial.println("UI Canvas: internal allocation failed; retrying in PSRAM");
+        _canvasUsePsram = true;
+        _canvas.setPsram(true);
+        sprite = _canvas.createSprite(width, height);
+    }
+    if (sprite == nullptr) return false;
 
-    // Abstract dark geometric lens elements
-    _canvas.fillTriangle(x + 10, y + 16, x + 94, y + 16, x + 45, y + 106, COLOR_PANEL);
-    _canvas.fillTriangle(x + 92, y + 18, x + 142, y + 68, x + 98, y + 112, COLOR_DARK);
-    _canvas.fillTriangle(x + 120, y + 60, x + 205, y + 16, x + 202, y + 108, COLOR_PANEL);
-    _canvas.fillTriangle(x + 118, y + 62, x + 166, y + 112, x + 210, y + 80, COLOR_SLATE);
-    _canvas.fillTriangle(x + 142, y + 72, x + 184, y + 34, x + 216, y + 74, COLOR_DARK);
-    _canvas.fillTriangle(x + 72, y + 24, x + 108, y + 110, x + 56, y + 112, COLOR_DARK);
-
-    // Diagonal light leak highlight band
-    const int16_t hx1 = x + 14;
-    const int16_t hy1 = y + 28;
-    const int16_t hx2 = x + 214;
-    const int16_t hy2 = y + 86;
-    const int16_t band = 12;
-    _canvas.fillTriangle(hx1, hy1, hx2, hy2, hx2, hy2 + band, COLOR_HILITE);
-    _canvas.fillTriangle(hx1, hy1, hx2, hy2 + band, hx1, hy1 + band, COLOR_HILITE);
-
-    // Layered aperture overlays
-    _canvas.fillTriangle(x + 150, y + 78, x + 184, y + 34, x + 216, y + 80, COLOR_DARK);
-    _canvas.fillTriangle(x + 146, y + 82, x + 210, y + 82, x + 134, y + 112, COLOR_DARK);
-
-    // Overlaid brand content with transparent background text
-    _canvas.setTextColor(COLOR_AMBER);
-    _canvas.setTextSize(3);
-    _canvas.setCursor(102, 20);
-    _canvas.print("GR");
-
-    // Subtitle
+    _width = width;
+    _height = height;
+    _orientation = orientation;
+    _canvasReady = true;
     _canvas.setTextSize(1);
-    _canvas.setTextColor(COLOR_WHITE);
-    _canvas.setCursor(84, 52);
-    _canvas.print("VIEWFINDER");
-
-    // Progress bar matching the layout
-    _canvas.drawRoundRect(40, 70, 160, 6, 3, COLOR_GRAPHITE);
-    _canvas.fillRoundRect(42, 72, 60, 2, 1, COLOR_AMBER);
-
-    // Dynamic boot status message
-    _canvas.setTextColor(COLOR_GRAY);
-    const char* msg = safeText(message, "Booting...");
-    int msgLen = strlen(msg);
-    _canvas.setCursor((240 - (msgLen * 6)) / 2, 86);
-    _canvas.print(msg);
-
-    // Footer divider and hotkeys hint
-    _canvas.drawFastHLine(20, _height - 24, 200, COLOR_SLATE);
-    _canvas.setCursor(60, _height - 16);
-    _canvas.print("BtnA: Shutter / Retry");
-
-    pushCanvas();
+    _canvas.setTextWrap(false);
+    _sceneDrawn = false;
+    return true;
 }
 
-void DisplayUi::showStatus(const char* line1, const char* line2, const char* line3, const char* line4) {
-    clear(COLOR_BG);
-
-    _canvas.drawFastHLine(10, 24, _width - 20, COLOR_SLATE);
-    _canvas.setTextSize(1);
-    _canvas.setTextColor(COLOR_AMBER, COLOR_BG);
-    _canvas.setCursor(10, 8);
-    _canvas.print("GR VIEWFINDER");
-
-    drawStatusLines(line1, line2, line3, line4);
-
-    pushCanvas();
-}
-
-void DisplayUi::showStatus(const String& line1, const String& line2, const String& line3, const String& line4) {
-    showStatus(line1.c_str(),
-               line2.length() ? line2.c_str() : nullptr,
-               line3.length() ? line3.c_str() : nullptr,
-               line4.length() ? line4.c_str() : nullptr);
-}
-
-void DisplayUi::showError(const char* message, const char* detail) {
-    clear(COLOR_BG);
-
-    // Header
-    _canvas.drawFastHLine(10, 24, _width - 20, COLOR_SLATE);
-    _canvas.setTextSize(1);
-    _canvas.setTextColor(COLOR_RED, COLOR_BG);
-    _canvas.setCursor(10, 8);
-    _canvas.print("SYSTEM ERROR");
-
-    // Outlined error card
-    _canvas.drawRoundRect(10, 32, 220, 78, 4, COLOR_RED);
-
-    _canvas.setTextColor(COLOR_RED, COLOR_BG);
-    _canvas.setCursor(20, 42);
-    _canvas.print(safeText(message, "Unknown error"));
-
-    if (detail != nullptr && detail[0] != '\0') {
-        _canvas.setTextColor(COLOR_WHITE, COLOR_BG);
-        _canvas.setCursor(20, 62);
-        _canvas.print(detail);
+bool DisplayUi::setOrientation(rvf::UiOrientation orientation) {
+    if (_frameWriteActive) return false;
+    if (_canvasReady && orientation == _orientation) {
+        const uint8_t rotation = rvf::viewfinderRotation(orientation, viewfinderMode(), _selfie);
+        if (M5.Display.getRotation() != rotation) {
+            // A half-turn preserves the canvas dimensions and needs no allocation.
+            M5.Display.setRotation(rotation);
+            clear(rvf::UiTheme::kBlack);
+            pushCanvas();
+            _sceneDrawn = false;
+        }
+        return true;
     }
 
-    // Footer action hint
-    _canvas.drawFastHLine(10, _height - 20, _width - 20, COLOR_SLATE);
-    _canvas.setTextColor(COLOR_WHITE, COLOR_BG);
-    _canvas.setCursor(50, _height - 14);
-    _canvas.print("Press BtnA to retry");
+    const uint32_t nowMs = millis();
+    if (_canvasReady && _orientationFailurePending && orientation == _failedOrientation &&
+        static_cast<int32_t>(nowMs - _orientationRetryAfterMs) < 0) {
+        return false;
+    }
 
+    const rvf::UiOrientation previous = _orientation;
+    const bool hadCanvas = _canvasReady;
+    Serial.printf("UI Canvas: switch %s -> %s heap=%lu psram=%lu\n",
+                  previous == rvf::UiOrientation::Portrait ? "portrait" : "landscape",
+                  orientation == rvf::UiOrientation::Portrait ? "portrait" : "landscape",
+                  static_cast<unsigned long>(ESP.getFreeHeap()),
+                  static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+
+    if (_canvasReady) {
+        _canvas.deleteSprite();
+        _canvasReady = false;
+    }
+    if (!createCanvasFor(orientation)) {
+        _failedOrientation = orientation;
+        _orientationRetryAfterMs = nowMs + rvf::UiTheme::kCanvasAllocationRetryMs;
+        _orientationFailurePending = true;
+        Serial.printf("UI Canvas: create failed; restoring previous orientation; retry_in=%lums "
+                      "largest_int=%lu largest_psram=%lu\n",
+                      static_cast<unsigned long>(rvf::UiTheme::kCanvasAllocationRetryMs),
+                      static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                      static_cast<unsigned long>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+        _canvas.deleteSprite();
+        _canvasReady = false;
+        if (hadCanvas && createCanvasFor(previous)) {
+            clear(rvf::UiTheme::kBlack);
+            pushCanvas();
+        }
+        return false;
+    }
+
+    _orientationFailurePending = false;
+    clear(rvf::UiTheme::kBlack);
     pushCanvas();
+    Serial.printf("UI Canvas: ready %dx%d storage=%s heap=%lu psram=%lu\n",
+                  _width,
+                  _height,
+                  _canvasUsePsram ? "psram" : "internal",
+                  static_cast<unsigned long>(ESP.getFreeHeap()),
+                  static_cast<unsigned long>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+    return true;
 }
 
-void DisplayUi::showError(const String& message, const String& detail) {
-    showError(message.c_str(), detail.length() ? detail.c_str() : nullptr);
-}
-
-// Redesigned transparent HUD overlay for Live Viewfinder (rendered onto _canvas)
-void DisplayUi::drawOverlay(const String& wifiStatus,
-                            const String& liveviewStatus,
-                            const String& model,
-                            const String& battery,
-                            float fps,
-                            int32_t rssi,
-                            uint32_t frames,
-                            uint32_t droppedFrames) {
-    // 1. Draw corner crop marks of the viewport (Assuming standard 4:3 centered image width 180, X=30..210)
-    const int16_t vx = 30;
-    const int16_t vy = 0;
-    const int16_t vw = 180;
-    const int16_t vh = 135;
-    const int16_t len = 8;
-
-    // Top-Left corner
-    _canvas.drawFastHLine(vx, vy, len, COLOR_WHITE);
-    _canvas.drawFastVLine(vx, vy, len, COLOR_WHITE);
-    // Top-Right corner
-    _canvas.drawFastHLine(vx + vw - len, vy, len, COLOR_WHITE);
-    _canvas.drawFastVLine(vx + vw - 1, vy, len, COLOR_WHITE);
-    // Bottom-Left corner
-    _canvas.drawFastHLine(vx, vy + vh - 1, len, COLOR_WHITE);
-    _canvas.drawFastVLine(vx, vy + vh - len, len, COLOR_WHITE);
-    // Bottom-Right corner
-    _canvas.drawFastHLine(vx + vw - len, vy + vh - 1, len, COLOR_WHITE);
-    _canvas.drawFastVLine(vx + vw - 1, vy + vh - len, len, COLOR_WHITE);
-
-    // 2. Draw autofocus bracket in the center (green, X=108..132, Y=59..75)
-    const int16_t cx = _width / 2;
-    const int16_t cy = _height / 2;
-    const int16_t bw = 12;
-    const int16_t bh = 8;
-
-    _canvas.drawFastVLine(cx - bw, cy - bh, bh * 2, COLOR_GREEN);
-    _canvas.drawFastHLine(cx - bw, cy - bh, 4, COLOR_GREEN);
-    _canvas.drawFastHLine(cx - bw, cy + bh - 1, 4, COLOR_GREEN);
-
-    _canvas.drawFastVLine(cx + bw - 1, cy - bh, bh * 2, COLOR_GREEN);
-    _canvas.drawFastHLine(cx + bw - 4, cy - bh, 4, COLOR_GREEN);
-    _canvas.drawFastHLine(cx + bw - 4, cy + bh - 1, 4, COLOR_GREEN);
-
-    // 3. Draw transparent HUD overlays
-    _canvas.setTextSize(1);
-
-    // Top-Left: LIVE state with a small status dot
-    const bool liveActive = (liveviewStatus == "LIVE");
-    _canvas.fillCircle(14, 10, 3, liveActive ? COLOR_GREEN : COLOR_YELLOW);
-    _canvas.setTextColor(COLOR_WHITE);
-    _canvas.setCursor(22, 6);
-    _canvas.print(liveActive ? "LIVE" : "IDLE");
-
-    // Top-Left (below LIVE): FPS display
-    char fpsText[16];
-    if (fps >= 0.0f) {
-        snprintf(fpsText, sizeof(fpsText), "%.1f FPS", static_cast<double>(fps));
-    } else {
-        snprintf(fpsText, sizeof(fpsText), "-- FPS");
-    }
-    _canvas.setTextColor(COLOR_GRAY);
-    _canvas.setCursor(14, 18);
-    _canvas.print(fpsText);
-
-    // Bottom-Left: Camera Model & Battery level icon
-    _canvas.setTextColor(COLOR_WHITE);
-    _canvas.setCursor(14, _height - 24);
-    if (model.length() > 0) {
-        _canvas.print(model.substring(0, 8));
-    } else {
-        _canvas.print("RICOH GR");
-    }
-    drawBatteryIcon(14, _height - 12, battery.c_str());
-
-    // Bottom-Right: RSSI (WiFi signal bars)
-    drawWifiIcon(_width - 24, _height - 12, rssi);
-
-    // Top-Right: Frame statistics
-    char statsText[24];
-    snprintf(statsText, sizeof(statsText), "%lu/%lu",
-             static_cast<unsigned long>(frames),
-             static_cast<unsigned long>(droppedFrames));
-    _canvas.setTextColor(droppedFrames == 0 ? COLOR_WHITE : COLOR_YELLOW);
-    _canvas.setCursor(_width - (strlen(statsText) * 6) - 14, 6);
-    _canvas.print(statsText);
-}
-
-int16_t DisplayUi::width() const {
-    return _width;
-}
-
-int16_t DisplayUi::height() const {
-    return _height;
+void DisplayUi::pushCanvas() {
+    if (_canvasReady) _canvas.pushSprite(&M5.Display, 0, 0);
 }
 
 void DisplayUi::clear(uint16_t color) {
-    _canvas.fillScreen(color);
+    if (_canvasReady) _canvas.fillScreen(color);
 }
 
-void DisplayUi::drawStatusLines(const char* line1, const char* line2, const char* line3, const char* line4) {
-    const char* s1 = safeText(line1);
-    const char* s2 = safeText(line2);
-    const char* s3 = safeText(line3);
-    const char* s4 = safeText(line4);
-
-    const bool bleStopped = statusContains(s1, s2, s3, s4, "BLE UNAVAILABLE") ||
-                            statusContains(s1, s2, s3, s4, "SCAN STOP") ||
-                            statusContains(s1, s2, s3, s4, "STOPPED") ||
-                            statusContains(s1, s2, s3, s4, "ATTEMPTS EXHAUSTED") ||
-                            statusContains(s1, s2, s3, s4, "CAMERA STANDBY") ||
-                            statusContains(s1, s2, s3, s4, "AUTO WAKE") ||
-                            statusContains(s1, s2, s3, s4, "COOLDOWN");
-
-    const bool bleConnected = statusContains(s1, s2, s3, s4, "BLE_READY") ||
-                              statusContains(s1, s2, s3, s4, "BLE LINK READY") ||
-                              statusContains(s1, s2, s3, s4, "WIFI") ||
-                              statusContains(s1, s2, s3, s4, "HTTP") ||
-                              statusContains(s1, s2, s3, s4, "LIVEVIEW") ||
-                              statusContains(s1, s2, s3, s4, "LIVE VIEW") ||
-                              statusContains(s1, s2, s3, s4, "BUTTON A SHUTTER");
-
-    const bool bleConnecting = statusContains(s1, s2, s3, s4, "CONNECTING") ||
-                               statusContains(s1, s2, s3, s4, "CAMERA FOUND") ||
-                               statusContains(s1, s2, s3, s4, "FAST CONNECT");
-
-    const char* bleStatus = "BLE SEARCHING...";
-    if (bleConnected) {
-        bleStatus = "BLE CONNECTED";
-    } else if (bleStopped) {
-        bleStatus = "BLE PAUSED";
-    } else if (bleConnecting) {
-        bleStatus = "BLE CONNECTING...";
-    }
-
-    // Fixed rectangular viewfinder frame. The border intentionally stays the
-    // same graphite color; only the GR IV status dot reflects BLE state.
-    const int16_t x = 8;
-    const int16_t y = 6;
-    const int16_t w = _width - 16;
-    const int16_t h = _height - 12;
-    _canvas.fillRoundRect(x, y, w, h, 10, COLOR_CARD);
-    _canvas.drawRoundRect(x, y, w, h, 10, COLOR_GRAPHITE);
-    _canvas.drawRoundRect(x + 2, y + 2, w - 4, h - 4, 8, COLOR_SLATE);
-
-    // Abstract dark geometric surface inspired by the reference image, adapted
-    // to the StickS3 rectangular screen instead of a round lens.
-    _canvas.fillTriangle(x + 10, y + 16, x + 94, y + 16, x + 45, y + 106, COLOR_PANEL);
-    _canvas.fillTriangle(x + 92, y + 18, x + 142, y + 68, x + 98, y + 112, COLOR_DARK);
-    _canvas.fillTriangle(x + 120, y + 60, x + 205, y + 16, x + 202, y + 108, COLOR_PANEL);
-    _canvas.fillTriangle(x + 118, y + 62, x + 166, y + 112, x + 210, y + 80, COLOR_SLATE);
-    _canvas.fillTriangle(x + 142, y + 72, x + 184, y + 34, x + 216, y + 74, COLOR_DARK);
-    _canvas.fillTriangle(x + 72, y + 24, x + 108, y + 110, x + 56, y + 112, COLOR_DARK);
-
-    // White diagonal highlight band.
-    const int16_t hx1 = x + 14;
-    const int16_t hy1 = y + 28;
-    const int16_t hx2 = x + 214;
-    const int16_t hy2 = y + 86;
-    const int16_t band = 12;
-    _canvas.fillTriangle(hx1, hy1, hx2, hy2, hx2, hy2 + band, COLOR_HILITE);
-    _canvas.fillTriangle(hx1, hy1, hx2, hy2 + band, hx1, hy1 + band, COLOR_HILITE);
-
-    // Re-darken lower lens facets over the highlight for a layered aperture feel.
-    _canvas.fillTriangle(x + 150, y + 78, x + 184, y + 34, x + 216, y + 80, COLOR_DARK);
-    _canvas.fillTriangle(x + 146, y + 82, x + 210, y + 82, x + 134, y + 112, COLOR_DARK);
-
-    _canvas.setTextSize(2);
-    _canvas.setTextColor(COLOR_WHITE, COLOR_CARD);
-    const char* title = "GR IV";
-    const int16_t titleW = static_cast<int16_t>(strlen(title) * 12);
-    const int16_t titleX = static_cast<int16_t>((_width - titleW) / 2 - 4);
-    _canvas.setCursor(titleX, y + 14);
-    _canvas.print(title);
-    _canvas.fillCircle(titleX + titleW + 11, y + 21, 4, bleConnected ? COLOR_GREEN : COLOR_RED);
-
-    _canvas.setTextSize(2);
-    const int16_t statusW = static_cast<int16_t>(strlen(bleStatus) * 12);
-    const int16_t statusX = static_cast<int16_t>((_width - statusW) / 2);
-    _canvas.setTextColor(COLOR_WHITE, COLOR_CARD);
-    _canvas.setCursor(statusX, y + h - 29);
-    _canvas.print(bleStatus);
-}
-// Graphic helper to draw WiFi RSSI strength bars
-void DisplayUi::drawWifiIcon(int16_t x, int16_t y, int32_t rssi) {
-    uint8_t bars = 0;
-    if (rssi < 0) {
-        if (rssi >= -60) bars = 4;
-        else if (rssi >= -70) bars = 3;
-        else if (rssi >= -80) bars = 2;
-        else bars = 1;
-    }
-
-    for (uint8_t i = 0; i < 4; ++i) {
-        uint16_t color = (i < bars) ? COLOR_GREEN : COLOR_SLATE;
-        int16_t barH = 2 + (i * 2);
-        _canvas.fillRect(x + (i * 3), y + (8 - barH), 2, barH, color);
-    }
+uint32_t DisplayUi::renderIntervalMs(rvf::UiScene scene) const {
+    if (scene == rvf::UiScene::CameraSleep) return 1000U / rvf::UiTheme::kSleepAnimationFps;
+    if (scene == rvf::UiScene::WifiProvisioning) return 500U;
+    if (scene == rvf::UiScene::Error) return 1000U;
+    return 1000U / rvf::UiTheme::kRemoteAnimationFps;
 }
 
-// Graphic helper to draw dynamic battery outline & fill level
-void DisplayUi::drawBatteryIcon(int16_t x, int16_t y, const char* batteryStr) {
-    int pct = -1;
-    const char* text = safeText(batteryStr);
-    for (size_t i = 0; text[i] != '\0'; ++i) {
-        if (isDigit(text[i])) {
-            if (pct < 0) pct = 0;
-            pct = pct * 10 + (text[i] - '0');
-        } else if (text[i] == '%' || text[i] == ' ') {
+void DisplayUi::updateBacklight(const rvf::UiViewModel& view) {
+    const bool sleeping = view.scene == rvf::UiScene::CameraSleep;
+    _backlight.setTarget(sleeping ? rvf::UiTheme::kSleepBrightness : rvf::UiTheme::kActiveBrightness,
+                         sleeping ? rvf::UiTheme::kSleepDimDurationMs
+                                  : rvf::UiTheme::kWakeBrightenDurationMs,
+                         view.nowMs);
+    if (_backlight.update(view.nowMs)) M5.Display.setBrightness(_backlight.value());
+}
+
+void DisplayUi::render(const rvf::UiViewModel& view) {
+    if (!setOrientation(view.orientation) || !_canvasReady) return;
+    updateBacklight(view);
+
+    const bool sceneChanged = !_sceneDrawn || view.scene != _lastScene;
+    if (view.scene == rvf::UiScene::LivePreview) {
+        _lastScene = view.scene;
+        _sceneDrawn = true;
+        return;
+    }
+    if (!sceneChanged && rvf::uiElapsedMs(view.nowMs, _lastRenderAtMs) < renderIntervalMs(view.scene)) {
+        return;
+    }
+
+    _lastRenderAtMs = view.nowMs;
+    _lastScene = view.scene;
+    _sceneDrawn = true;
+    clear(rvf::UiTheme::kBlack);
+    switch (view.scene) {
+        case rvf::UiScene::Boot:
+            drawBoot(view);
             break;
+        case rvf::UiScene::PairingGuide:
+            drawPairingGuide(view);
+            break;
+        case rvf::UiScene::WifiProvisioning:
+            drawWifiProvisioning(view);
+            break;
+        case rvf::UiScene::Pairing:
+        case rvf::UiScene::Connecting:
+            drawConnecting(view);
+            break;
+        case rvf::UiScene::RemoteReady:
+            drawRemote(view);
+            break;
+        case rvf::UiScene::ResetPairing:
+            drawReset(view);
+            break;
+        case rvf::UiScene::CameraSleep:
+            drawSleep(view);
+            break;
+        case rvf::UiScene::Disconnected:
+            drawDisconnected(view);
+            break;
+        case rvf::UiScene::Error:
+            drawError(view);
+            break;
+        case rvf::UiScene::LivePreview:
+            break;
+    }
+    if (view.scene == rvf::UiScene::RemoteReady) drawViewfinderMode();
+    if (view.scene != rvf::UiScene::LivePreview) drawShutterOverlay(view);
+    pushCanvas();
+}
+
+LovyanGFX* DisplayUi::beginLiveFrame() {
+    if (!_canvasReady || _frameWriteActive || _orientation != rvf::UiOrientation::Landscape) return nullptr;
+    _frameWriteActive = true;
+    return &_canvas;
+}
+
+void DisplayUi::finishLiveFrame(bool push) {
+    if (!_frameWriteActive) return;
+    if (push) pushCanvas();
+    _frameWriteActive = false;
+}
+
+void DisplayUi::renderLiveFrameOverlay(const rvf::UiViewModel& view) {
+    if (!_canvasReady || !_frameWriteActive) return;
+    drawBatteryIndicator(view);
+    drawViewfinderMode();
+    drawShutterOverlay(view);
+}
+
+void DisplayUi::drawViewfinderMode() {
+    if (!rvf::kAutoSelfieEnabled) return;
+    const char* label = rvf::viewfinderLabel(viewfinderMode(), _selfie);
+    _canvas.setTextSize(1);
+    _canvas.setTextColor(rvf::UiTheme::kWhite, rvf::UiTheme::kBlack);
+    _canvas.setTextDatum(textdatum_t::top_left);
+    _canvas.drawString(label, 4, 5);
+}
+
+void DisplayUi::drawBoot(const rvf::UiViewModel& view) {
+    const int16_t radius = static_cast<int16_t>(4 + 2 * view.sceneProgress);
+    _canvas.fillCircle(_width / 2, _height / 2, radius, rvf::UiTheme::kWhite);
+}
+
+void DisplayUi::drawPairingGuide(const rvf::UiViewModel& view) {
+    drawCenteredText("PAIR CAMERA", 24, rvf::UiTheme::kWhite);
+    drawCenteredText("B: SELECT", 48, rvf::UiTheme::kGray);
+
+    constexpr int16_t optionX = 12;
+    constexpr int16_t optionWidth = 111;
+    constexpr int16_t optionHeight = 28;
+    // Rows at 70 / 105 / 140 leave room for three models above "A: CONFIRM";
+    // a fourth needs a tighter pitch or a scrolling list.
+    constexpr int16_t firstOptionY = 70;
+    constexpr int16_t optionPitch = 35;
+
+    const auto drawOption = [this, optionX, optionWidth, optionHeight](
+                                const char* label, int16_t y, bool selected) {
+        const uint16_t color = selected ? rvf::UiTheme::kGreen : rvf::UiTheme::kDarkGray;
+        _canvas.drawRect(optionX, y, optionWidth, optionHeight, color);
+        if (selected) {
+            _canvas.drawRect(optionX + 1, y + 1, optionWidth - 2, optionHeight - 2, color);
         }
+        drawCenteredText(label, y + 13, selected ? rvf::UiTheme::kGreen : rvf::UiTheme::kWhite);
+    };
+
+    for (size_t i = 0; i < rvf::cameraModelCount(); ++i) {
+        drawOption(rvf::cameraModelAt(i).label,
+                   static_cast<int16_t>(firstOptionY + optionPitch * i),
+                   i == view.pairingGuideSelectedIndex);
     }
+    drawCenteredText("A: CONFIRM", 181, rvf::UiTheme::kWhite);
+    drawCenteredText(rvf::cameraModelAt(view.pairingGuideSelectedIndex).setupHint,
+                     207,
+                     rvf::UiTheme::kGray);
+}
 
-    _canvas.drawRect(x, y, 14, 8, COLOR_WHITE);
-    _canvas.fillRect(x + 14, y + 2, 1, 4, COLOR_WHITE);
+void DisplayUi::drawWifiProvisioning(const rvf::UiViewModel& view) {
+    drawCenteredText("GR II WIFI SETUP", 28, rvf::UiTheme::kWhite);
+    if (view.wifiProvisioningPreparing) {
+        drawCenteredText("SCANNING CAMERA WIFI", 88, rvf::UiTheme::kGreen);
+        drawCenteredText("PLEASE WAIT...", 122, rvf::UiTheme::kGray);
+        drawCenteredText("NO BLUETOOTH", 184, rvf::UiTheme::kDarkGray);
+        return;
+    }
+    drawCenteredText("1. PHONE JOIN", 61, rvf::UiTheme::kGray);
+    drawCenteredText(safeText(view.provisioningSsid, "GR-II-Setup"), 83, rvf::UiTheme::kGreen);
+    char passwordLine[40] = {0};
+    snprintf(passwordLine, sizeof(passwordLine), "PASSWORD: %s",
+             safeText(view.provisioningPassword, "SEE SCREEN"));
+    drawCenteredText(passwordLine, 112, rvf::UiTheme::kGray);
+    drawCenteredText("2. OPEN IN BROWSER", 151, rvf::UiTheme::kGray);
+    drawCenteredText(safeText(view.provisioningUrl, "http://192.168.4.1"), 174,
+                     rvf::UiTheme::kGreen);
+    drawCenteredText("HOLD B: CANCEL", 211, rvf::UiTheme::kDarkGray);
+}
 
-    if (pct >= 0) {
-        if (pct > 100) pct = 100;
-        int fillW = (pct * 10) / 100;
-        if (fillW > 10) fillW = 10;
-
-        uint16_t color = COLOR_GREEN;
-        if (pct < 20) color = COLOR_RED;
-        else if (pct < 50) color = COLOR_YELLOW;
-
-        _canvas.fillRect(x + 2, y + 2, fillW, 4, color);
+void DisplayUi::drawConnecting(const rvf::UiViewModel& view) {
+    const float progress = rvf::uiSmoothStep(view.sceneProgress);
+    const int16_t centerX = _width / 2;
+    const int16_t centerY = _height / 2;
+    const int16_t leftStart = _width * 24 / 100;
+    const int16_t rightStart = _width - leftStart;
+    const int16_t leftX = static_cast<int16_t>(leftStart + (centerX - leftStart) * progress);
+    const int16_t rightX = static_cast<int16_t>(rightStart + (centerX - rightStart) * progress);
+    const int16_t dotRadius = rvf::UiTheme::kConnectDotDiameter / 2;
+    if (!view.bleConnected) {
+        _canvas.fillCircle(leftX, centerY, dotRadius, rvf::UiTheme::kGreen);
+        _canvas.fillCircle(rightX, centerY, dotRadius, rvf::UiTheme::kGreen);
     } else {
-        _canvas.drawLine(x + 2, y + 2, x + 11, y + 5, COLOR_GRAY);
+        const float merge = (progress - 0.94f) / 0.06f;
+        const int16_t mergedRadius = static_cast<int16_t>(dotRadius +
+            (rvf::UiTheme::kConnectMergedDiameter / 2 - dotRadius) * rvf::uiClamp01(merge));
+        _canvas.fillCircle(centerX, centerY, mergedRadius, rvf::UiTheme::kGreen);
     }
+}
+
+void DisplayUi::drawRemote(const rvf::UiViewModel& view) {
+    const int16_t centerX = _width / 2;
+    const int16_t centerY = _height / 2;
+    const float scale = 1.0f - (1.0f - rvf::UiTheme::kRemoteFocusScalePct / 100.0f) *
+                                     view.focusProgress;
+    const int16_t radius = static_cast<int16_t>(rvf::UiTheme::kRemoteApertureDiameter * scale / 2.0f);
+    const uint16_t ringColor = view.focusProgress > 0.0f ? rvf::UiTheme::kGreen : rvf::UiTheme::kWhite;
+    if (view.focusActive && view.focusProgress <= 0.0f) {
+        _canvas.drawCircle(centerX, centerY, radius + 3, rvf::UiTheme::kDarkGray);
+    }
+    _canvas.drawCircle(centerX, centerY, radius, ringColor);
+    _canvas.drawCircle(centerX, centerY, radius - 1, ringColor);
+    _canvas.fillCircle(centerX,
+                       centerY,
+                       rvf::UiTheme::kRemoteCoreDiameter / 2,
+                       rvf::UiTheme::kWhite);
+    drawBatteryIndicator(view);
+}
+
+void DisplayUi::drawReset(const rvf::UiViewModel& view) {
+    const int16_t centerX = _width / 2;
+    const int16_t centerY = _height / 2;
+    if (view.resetSplitActive) {
+        const float progress = rvf::uiEaseOut(view.resetSplitProgress);
+        const int16_t offset = static_cast<int16_t>(rvf::UiTheme::kResetSplitDistance * progress);
+        _canvas.fillCircle(centerX - offset, centerY, 10, rvf::UiTheme::kRed);
+        _canvas.fillCircle(centerX + offset, centerY, 10, rvf::UiTheme::kRed);
+    } else {
+        _canvas.fillCircle(centerX,
+                           centerY,
+                           rvf::UiTheme::kResetCircleDiameter / 2,
+                           rvf::UiTheme::kGreen);
+    }
+
+    const int16_t barWidth = _width * rvf::UiTheme::kResetProgressWidthPct / 100;
+    const int16_t barX = (_width - barWidth) / 2;
+    const int16_t barY = _height - rvf::UiTheme::kResetProgressBottom -
+                         rvf::UiTheme::kResetProgressHeight;
+    _canvas.fillRect(barX, barY, barWidth, rvf::UiTheme::kResetProgressHeight,
+                     rvf::UiTheme::kDarkGray);
+    _canvas.fillRect(barX,
+                     barY,
+                     static_cast<int16_t>(barWidth * rvf::uiClamp01(view.resetProgress)),
+                     rvf::UiTheme::kResetProgressHeight,
+                     rvf::UiTheme::kRed);
+}
+
+void DisplayUi::drawSleep(const rvf::UiViewModel& view) {
+    const int16_t drift = static_cast<int16_t>(12.0f * view.sleepProgress);
+    _canvas.setTextSize(2);
+    _canvas.setTextColor(rvf::UiTheme::kSleepGray, rvf::UiTheme::kBlack);
+    _canvas.setCursor(_width / 2 - 12, _height / 2 - 12 + drift);
+    _canvas.print("Z");
+    _canvas.setTextSize(1);
+    _canvas.setCursor(_width / 2 + 5, _height / 2 + drift);
+    _canvas.print("z");
+}
+
+void DisplayUi::drawDisconnected(const rvf::UiViewModel& view) {
+    const int16_t centerX = _width / 2;
+    const int16_t centerY = _height / 2;
+    const int16_t offset = static_cast<int16_t>(rvf::UiTheme::kResetSplitDistance * view.sceneProgress);
+    _canvas.fillCircle(centerX - offset, centerY, 8, rvf::UiTheme::kGray);
+    _canvas.fillCircle(centerX + offset, centerY, 8, rvf::UiTheme::kGray);
+}
+
+void DisplayUi::drawCenteredText(const char* text, int16_t y, uint16_t color) {
+    char clipped[41];
+    const size_t maxChars = _width < _height ? 20 : 36;
+    snprintf(clipped, sizeof(clipped), "%.*s", static_cast<int>(maxChars), safeText(text));
+    _canvas.setTextSize(1);
+    _canvas.setTextColor(color, rvf::UiTheme::kBlack);
+    const int16_t x = std::max<int16_t>(0, (_width - static_cast<int16_t>(strlen(clipped) * 6)) / 2);
+    _canvas.setCursor(x, y);
+    _canvas.print(clipped);
+}
+
+void DisplayUi::drawError(const rvf::UiViewModel& view) {
+    _canvas.fillCircle(_width / 2, _height / 2 - 24, 8, rvf::UiTheme::kRed);
+    drawCenteredText(safeText(view.errorTitle, "Camera unavailable"), _height / 2, rvf::UiTheme::kWhite);
+    drawCenteredText(safeText(view.errorDetail, "Press A to retry"), _height / 2 + 14, rvf::UiTheme::kGray);
+}
+
+void DisplayUi::drawBatteryIndicator(const rvf::UiViewModel& view) {
+    const int percent = view.deviceBatteryPercent;
+    const int16_t x = _width - 22;
+    const int16_t y = 7;
+    if (view.deviceCharging) {
+        // Primitive lightning glyph avoids depending on Unicode font support.
+        const int16_t boltX = x - 8;
+        _canvas.drawLine(boltX + 5, y, boltX + 1, y + 4, rvf::UiTheme::kGreen);
+        _canvas.drawLine(boltX + 1, y + 4, boltX + 4, y + 4, rvf::UiTheme::kGreen);
+        _canvas.drawLine(boltX + 4, y + 4, boltX, y + 8, rvf::UiTheme::kGreen);
+    }
+    _canvas.drawRect(x, y, 14, 8, rvf::UiTheme::kWhite);
+    _canvas.fillRect(x + 14, y + 2, 2, 4, rvf::UiTheme::kWhite);
+    if (percent >= 0) {
+        const int16_t fill = std::max<int16_t>(1, std::min<int16_t>(10, percent / 10));
+        const uint16_t color = percent < 20 ? rvf::UiTheme::kRed : rvf::UiTheme::kWhite;
+        _canvas.fillRect(x + 2, y + 2, fill, 4, color);
+    }
+}
+
+void DisplayUi::drawShutterOverlay(const rvf::UiViewModel& view) {
+    if (!view.shutterOverlayActive) return;
+    if (_orientation == rvf::UiOrientation::Portrait) {
+        const float intensity = 1.0f - rvf::uiEaseOut(view.overlayProgress);
+        _canvas.fillScreen(view.shutterFailed ?
+                               static_cast<uint16_t>((static_cast<uint16_t>(31 * intensity) << 11)) :
+                               gray565(intensity));
+        return;
+    }
+
+    const float triangular = view.overlayProgress <= 0.5f
+                                 ? view.overlayProgress * 2.0f
+                                 : (1.0f - view.overlayProgress) * 2.0f;
+    const int16_t thickness = std::max<int16_t>(1,
+        static_cast<int16_t>(rvf::UiTheme::kShutterFrameWidth * rvf::uiEaseOut(triangular)));
+    const uint16_t color = view.shutterFailed ? rvf::UiTheme::kRed : rvf::UiTheme::kWhite;
+    _canvas.fillRect(0, 0, _width, thickness, color);
+    _canvas.fillRect(0, _height - thickness, _width, thickness, color);
+    _canvas.fillRect(0, 0, thickness, _height, color);
+    _canvas.fillRect(_width - thickness, 0, thickness, _height, color);
+}
+
+void DisplayUi::showBoot(const char*) {
+    rvf::UiViewModel view;
+    view.scene = rvf::UiScene::Boot;
+    view.orientation = rvf::UiOrientation::Portrait;
+    view.nowMs = millis();
+    view.sceneProgress = 0.5f;
+    _sceneDrawn = false;
+    render(view);
+}
+
+void DisplayUi::showStatus(const char*, const char*, const char*, const char*) {
+    rvf::UiViewModel view;
+    view.scene = rvf::UiScene::Pairing;
+    view.orientation = rvf::UiOrientation::Portrait;
+    view.nowMs = millis();
+    view.sceneProgress = 0.25f;
+    _sceneDrawn = false;
+    render(view);
+}
+
+void DisplayUi::showStatus(const String& line1, const String& line2, const String& line3, const String& line4) {
+    showStatus(line1.c_str(), line2.c_str(), line3.c_str(), line4.c_str());
+}
+
+void DisplayUi::showError(const char* message, const char* detail) {
+    rvf::UiViewModel view;
+    view.scene = rvf::UiScene::Error;
+    view.orientation = rvf::UiOrientation::Portrait;
+    view.nowMs = millis();
+    view.errorTitle = message;
+    view.errorDetail = detail;
+    _sceneDrawn = false;
+    render(view);
+}
+
+void DisplayUi::showError(const String& message, const String& detail) {
+    showError(message.c_str(), detail.c_str());
+}
+
+void DisplayUi::showPasskeyEntry(const uint8_t digits[6], uint8_t activeIndex, uint8_t remainingSec) {
+    if (!setOrientation(rvf::UiOrientation::Portrait) || !_canvasReady) return;
+    clear(rvf::UiTheme::kBlack);
+
+    drawCenteredText("PAIRING PASSKEY", 26, rvf::UiTheme::kGreen);
+    drawCenteredText("Match camera code", 44, rvf::UiTheme::kGray);
+
+    // Keep all six cells inside the StickS3's 135-pixel portrait width.
+    const int16_t cellW = 16;
+    const int16_t cellH = 30;
+    const int16_t gap = 3;
+    const int16_t totalW = 6 * cellW + 5 * gap;
+    const int16_t startX = (_width - totalW) / 2;
+    const int16_t y = _height / 2 - cellH / 2;
+
+    _canvas.setTextSize(2);
+    for (uint8_t i = 0; i < 6; ++i) {
+        const int16_t x = startX + i * (cellW + gap);
+        const bool active = i == activeIndex;
+        const bool confirmed = i < activeIndex;
+        const uint16_t frame = active ? rvf::UiTheme::kGreen : rvf::UiTheme::kDarkGray;
+        const uint16_t text = active ? rvf::UiTheme::kGreen :
+                              (confirmed ? rvf::UiTheme::kWhite : rvf::UiTheme::kGray);
+        _canvas.drawRoundRect(x, y, cellW, cellH, 4, frame);
+        _canvas.setTextColor(text, rvf::UiTheme::kBlack);
+        _canvas.setCursor(x + 2, y + 7);
+        _canvas.print(static_cast<char>('0' + (digits[i] % 10)));
+    }
+
+    _canvas.setTextSize(1);
+    if (activeIndex < 6 && remainingSec > 0) {
+        // The camera abandons the pairing at its own deadline; show what is
+        // left so a slow entry is restarted rather than typed into the void.
+        char countdown[16] = {0};
+        snprintf(countdown, sizeof(countdown), "%us left", static_cast<unsigned>(remainingSec));
+        drawCenteredText(countdown, y + cellH + 14,
+                         remainingSec <= 10 ? rvf::UiTheme::kRed : rvf::UiTheme::kGray);
+    }
+    if (activeIndex >= 6) {
+        drawCenteredText("Submitting...", _height - 28, rvf::UiTheme::kGreen);
+    } else {
+        drawCenteredText("A:+1  B:next", _height - 38, rvf::UiTheme::kWhite);
+        drawCenteredText("Hold A:submit", _height - 24, rvf::UiTheme::kWhite);
+    }
+    pushCanvas();
 }
