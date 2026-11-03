@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ void tearDown(void) {}
 #include "ui/OrientationTracker.h"
 #include "ui/PairingGuide.h"
 #include "ui/UiCoordinator.h"
+#include "ui/ViewfinderMode.h"
 
 namespace {
 
@@ -287,6 +289,114 @@ void testOrientationHysteresisPreventsBoundaryChatter() {
                         static_cast<int>(tracker.orientation()));
 }
 
+void feedPose(rvf::OrientationTracker& tracker, float x, float y, float z,
+              uint32_t startMs, uint32_t durationMs) {
+  for (uint32_t offset = 0; offset <= durationMs; offset += 40) {
+    tracker.update(x, y, z, startMs + offset);
+  }
+}
+
+void testAutoSelfieStartsFlatAndReturnsFromRaisedPose() {
+  rvf::OrientationTracker tracker;
+  feedPose(tracker, 0, 0, 1, 0, 1000);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  feedPose(tracker, 0, 1, 0, 1040, 400);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  feedPose(tracker, 0, 1, 0, 1480, 600);
+  TEST_ASSERT_TRUE(tracker.selfie());
+  feedPose(tracker, 0, 0, 1, 2120, 400);
+  TEST_ASSERT_TRUE(tracker.selfie());
+  feedPose(tracker, 0, 0, 1, 2560, 600);
+  TEST_ASSERT_FALSE(tracker.selfie());
+}
+
+void testAutoSelfieRaisedBootRequiresStablePose() {
+  rvf::OrientationTracker tracker;
+  tracker.update(0, -1, 0, 100);
+  tracker.update(0, -1, 0, 599);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  tracker.update(0, -1, 0, 600);
+  TEST_ASSERT_TRUE(tracker.selfie());
+}
+
+void testAutoSelfieIgnoresHingeBoundaryAndPortraitRoll() {
+  rvf::OrientationTracker tracker;
+  feedPose(tracker, 0, 0.71f, 0.71f, 0, 1000);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  feedPose(tracker, 1, 0, 0, 1040, 1000);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  feedPose(tracker, 0, 1, 0, 2080, 1000);
+  TEST_ASSERT_TRUE(tracker.selfie());
+  feedPose(tracker, 0, 0.71f, 0.71f, 3120, 1000);
+  TEST_ASSERT_TRUE(tracker.selfie());
+  feedPose(tracker, 1, 0, 0, 4160, 1000);
+  TEST_ASSERT_TRUE(tracker.selfie());
+}
+
+void testAutoSelfieRejectsBriefLiftAndInvalidSamples() {
+  rvf::OrientationTracker tracker;
+  feedPose(tracker, 0, 0, 1, 0, 1000);
+  feedPose(tracker, 0, 1, 0, 1040, 200);
+  feedPose(tracker, 0, 0, 1, 1280, 1000);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  tracker.reset(rvf::UiOrientation::Portrait);
+  tracker.update(0, 1, 0, 100);
+  tracker.update(0, std::numeric_limits<float>::quiet_NaN(), 0, 550);
+  tracker.update(0, 1, 0, 600);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  tracker.update(0, 1, 0, 1100);
+  TEST_ASSERT_TRUE(tracker.selfie());
+}
+
+void testAutoSelfieUnavailableAndResetUseTopDown() {
+  rvf::OrientationTracker tracker;
+  feedPose(tracker, 0, 1, 0, 0, 1000);
+  TEST_ASSERT_TRUE(tracker.selfie());
+  tracker.setAvailable(false);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  TEST_ASSERT_FALSE(tracker.update(0, 1, 0, 2000));
+  tracker.reset(rvf::UiOrientation::Portrait);
+  tracker.setAvailable(true);
+  TEST_ASSERT_FALSE(tracker.selfie());
+}
+
+void testAutoSelfieStabilitySurvivesMillisWrap() {
+  rvf::OrientationTracker tracker;
+  tracker.reset(rvf::UiOrientation::Portrait, 0xFFFFFF00U);
+  tracker.update(0, 1, 0, 0xFFFFFF00U);
+  tracker.update(0, 1, 0, 0x000000F3U);
+  TEST_ASSERT_FALSE(tracker.selfie());
+  tracker.update(0, 1, 0, 0x000000F4U);
+  TEST_ASSERT_TRUE(tracker.selfie());
+}
+
+void testViewfinderModesPreserveManualBehaviorAndTransformSelfie() {
+  using rvf::ViewfinderMode;
+  using rvf::UiOrientation;
+  for (bool mirrored : {false, true}) {
+    const auto expected = rvf::kAutoSelfieEnabled ? ViewfinderMode::AutoSelfie
+        : (mirrored ? ViewfinderMode::Mirrored : ViewfinderMode::Normal);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(expected),
+                         static_cast<int>(rvf::configuredViewfinderMode(mirrored)));
+  }
+  for (bool selfie : {false, true}) {
+    TEST_ASSERT_FALSE(rvf::viewfinderMirrored(ViewfinderMode::Normal, selfie));
+    TEST_ASSERT_TRUE(rvf::viewfinderMirrored(ViewfinderMode::Mirrored, selfie));
+    TEST_ASSERT_EQUAL_INT(1, rvf::viewfinderRotation(UiOrientation::Landscape, ViewfinderMode::Normal, selfie));
+    TEST_ASSERT_EQUAL_INT(1, rvf::viewfinderRotation(UiOrientation::Landscape, ViewfinderMode::Mirrored, selfie));
+    TEST_ASSERT_EQUAL_INT(selfie ? 2 : 0, rvf::viewfinderRotation(UiOrientation::Portrait, ViewfinderMode::AutoSelfie, selfie));
+  }
+  TEST_ASSERT_FALSE(rvf::viewfinderMirrored(ViewfinderMode::AutoSelfie, false));
+  TEST_ASSERT_TRUE(rvf::viewfinderMirrored(ViewfinderMode::AutoSelfie, true));
+  TEST_ASSERT_EQUAL_INT(1, rvf::viewfinderRotation(UiOrientation::Landscape, ViewfinderMode::AutoSelfie, false));
+  TEST_ASSERT_EQUAL_INT(3, rvf::viewfinderRotation(UiOrientation::Landscape, ViewfinderMode::AutoSelfie, true));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(UiOrientation::Landscape),
+      static_cast<int>(rvf::viewfinderOrientation(ViewfinderMode::AutoSelfie, UiOrientation::Portrait)));
+  TEST_ASSERT_EQUAL_INT(static_cast<int>(UiOrientation::Portrait),
+      static_cast<int>(rvf::viewfinderOrientation(ViewfinderMode::Normal, UiOrientation::Portrait)));
+
+}
+
 void testLiveViewLockForcesLandscapeAndUnlockRestoresPosture() {
   TEST_ASSERT_EQUAL_INT(
       static_cast<int>(rvf::UiOrientation::Landscape),
@@ -520,6 +630,13 @@ int main() {
   RUN_TEST(testOrientationRequiresStableCandidate);
   RUN_TEST(testOrientationMapsStickS3PhysicalAxes);
   RUN_TEST(testOrientationHysteresisPreventsBoundaryChatter);
+  RUN_TEST(testAutoSelfieStartsFlatAndReturnsFromRaisedPose);
+  RUN_TEST(testAutoSelfieRaisedBootRequiresStablePose);
+  RUN_TEST(testAutoSelfieIgnoresHingeBoundaryAndPortraitRoll);
+  RUN_TEST(testAutoSelfieRejectsBriefLiftAndInvalidSamples);
+  RUN_TEST(testAutoSelfieUnavailableAndResetUseTopDown);
+  RUN_TEST(testAutoSelfieStabilitySurvivesMillisWrap);
+  RUN_TEST(testViewfinderModesPreserveManualBehaviorAndTransformSelfie);
   RUN_TEST(testLiveViewLockForcesLandscapeAndUnlockRestoresPosture);
   RUN_TEST(testActivePreviewOutlivesPortraitUiForLockHandoff);
   RUN_TEST(testAnimationProgressAndCompletion);

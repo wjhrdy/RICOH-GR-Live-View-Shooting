@@ -267,6 +267,10 @@ void waitForSerialConsole() {
 }
 
 void restoreDisplaySettings() {
+  if (rvf::kAutoSelfieEnabled) {
+    Serial.println("Display: auto-selfie enabled by build flag");
+    return;
+  }
   bool mirrored = false;
   if (settingsStore.loadDisplayMirror(mirrored)) {
     ui.setMirrored(mirrored);
@@ -275,6 +279,7 @@ void restoreDisplaySettings() {
 }
 
 void toggleDisplayMirror() {
+  if (rvf::kAutoSelfieEnabled) return;
   const bool mirrored = ui.toggleMirror();
   const bool persisted = settingsStore.saveDisplayMirror(mirrored);
   Serial.printf("Display: mirrored=%d persisted=%d\n",
@@ -411,7 +416,7 @@ rvf::UiOrientation sampleUiOrientation(const rvf::UiSnapshot& snapshot, uint32_t
       orientationTracker.update(accelX, accelY, accelZ, nowMs);
     }
   }
-  return orientationTracker.orientation();
+  return rvf::viewfinderOrientation(ui.viewfinderMode(), orientationTracker.orientation());
 }
 
 void updateUi(const ButtonEvents& input) {
@@ -419,6 +424,7 @@ void updateUi(const ButtonEvents& input) {
   const uint32_t nowMs = millis();
   const rvf::UiSnapshot snapshot = makeUiSnapshot();
   const rvf::UiOrientation sensedOrientation = sampleUiOrientation(snapshot, nowMs);
+  ui.setSelfiePose(orientationTracker.selfie());
   const rvf::UiOrientation orientation = runtime.applyPreviewOrientation(sensedOrientation);
   uiCoordinator.update(snapshot, input, orientation, nowMs);
   ui.render(uiCoordinator.viewModel());

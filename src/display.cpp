@@ -51,8 +51,8 @@ bool DisplayUi::begin() {
 }
 
 bool DisplayUi::createCanvasFor(rvf::UiOrientation orientation) {
-    const uint8_t primaryRotation = orientation == rvf::UiOrientation::Portrait ? 0 : 1;
-    const uint8_t alternateRotation = orientation == rvf::UiOrientation::Portrait ? 2 : 3;
+    const uint8_t primaryRotation = rvf::viewfinderRotation(orientation, viewfinderMode(), _selfie);
+    const uint8_t alternateRotation = (primaryRotation + 2) % 4;
     M5.Display.setRotation(primaryRotation);
     bool shapeMatches = orientation == rvf::UiOrientation::Portrait
                             ? M5.Display.width() < M5.Display.height()
@@ -86,8 +86,18 @@ bool DisplayUi::createCanvasFor(rvf::UiOrientation orientation) {
 }
 
 bool DisplayUi::setOrientation(rvf::UiOrientation orientation) {
-    if (_canvasReady && orientation == _orientation) return true;
     if (_frameWriteActive) return false;
+    if (_canvasReady && orientation == _orientation) {
+        const uint8_t rotation = rvf::viewfinderRotation(orientation, viewfinderMode(), _selfie);
+        if (M5.Display.getRotation() != rotation) {
+            // A half-turn preserves the canvas dimensions and needs no allocation.
+            M5.Display.setRotation(rotation);
+            clear(rvf::UiTheme::kBlack);
+            pushCanvas();
+            _sceneDrawn = false;
+        }
+        return true;
+    }
 
     const uint32_t nowMs = millis();
     if (_canvasReady && _orientationFailurePending && orientation == _failedOrientation &&
@@ -139,15 +149,6 @@ bool DisplayUi::setOrientation(rvf::UiOrientation orientation) {
 
 void DisplayUi::pushCanvas() {
     if (_canvasReady) _canvas.pushSprite(&M5.Display, 0, 0);
-}
-
-void DisplayUi::setMirrored(bool mirrored) {
-    _mirrored = mirrored;
-}
-
-bool DisplayUi::toggleMirror() {
-    _mirrored = !_mirrored;
-    return _mirrored;
 }
 
 void DisplayUi::clear(uint16_t color) {
@@ -220,6 +221,7 @@ void DisplayUi::render(const rvf::UiViewModel& view) {
         case rvf::UiScene::LivePreview:
             break;
     }
+    if (view.scene == rvf::UiScene::RemoteReady) drawViewfinderMode();
     if (view.scene != rvf::UiScene::LivePreview) drawShutterOverlay(view);
     pushCanvas();
 }
@@ -239,7 +241,17 @@ void DisplayUi::finishLiveFrame(bool push) {
 void DisplayUi::renderLiveFrameOverlay(const rvf::UiViewModel& view) {
     if (!_canvasReady || !_frameWriteActive) return;
     drawBatteryIndicator(view);
+    drawViewfinderMode();
     drawShutterOverlay(view);
+}
+
+void DisplayUi::drawViewfinderMode() {
+    if (!rvf::kAutoSelfieEnabled) return;
+    const char* label = rvf::viewfinderLabel(viewfinderMode(), _selfie);
+    _canvas.setTextSize(1);
+    _canvas.setTextColor(rvf::UiTheme::kWhite, rvf::UiTheme::kBlack);
+    _canvas.setTextDatum(textdatum_t::top_left);
+    _canvas.drawString(label, 4, 5);
 }
 
 void DisplayUi::drawBoot(const rvf::UiViewModel& view) {

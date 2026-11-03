@@ -20,6 +20,33 @@ void OrientationTracker::reset(UiOrientation orientation, uint32_t nowMs) {
     _filteredZ = 0.0f;
     _candidateSinceMs = nowMs;
     _lastCommittedAtMs = nowMs;
+    _selfie = false;
+    _selfieCandidateActive = false;
+}
+
+void OrientationTracker::updateSelfie(uint32_t nowMs) {
+    const float x = std::fabs(_filteredX);
+    const float y = std::fabs(_filteredY);
+    const float z = std::fabs(_filteredZ);
+    bool candidate = _selfie;
+    // Landscape hinge: Z dominates face-up; Y dominates when raised toward the subject.
+    // shortcut: gravity cannot distinguish hinge motion from camera tilt; use a hinge sensor if needed.
+    if (z > x + UiTheme::kOrientationHysteresisG &&
+        z > y + UiTheme::kOrientationHysteresisG && z >= UiTheme::kOrientationMinAxisG) {
+        candidate = false;
+    } else if (y > x + UiTheme::kOrientationHysteresisG &&
+               y > z + UiTheme::kOrientationHysteresisG && y >= UiTheme::kOrientationMinAxisG) {
+        candidate = true;
+    }
+    if (candidate == _selfie) {
+        _selfieCandidateActive = false;
+    } else if (!_selfieCandidateActive) {
+        _selfieCandidateActive = true;
+        _selfieCandidateSinceMs = nowMs;
+    } else if (uiElapsedMs(nowMs, _selfieCandidateSinceMs) >= UiTheme::kOrientationStableMs) {
+        _selfie = candidate;
+        _selfieCandidateActive = false;
+    }
 }
 
 UiOrientation OrientationTracker::classify(float x, float y) const {
@@ -40,6 +67,11 @@ UiOrientation OrientationTracker::classify(float x, float y) const {
 
 bool OrientationTracker::update(float accelX, float accelY, float accelZ, uint32_t nowMs) {
     if (!_available) return false;
+    if (!std::isfinite(accelX) || !std::isfinite(accelY) || !std::isfinite(accelZ)) {
+        _candidateActive = false;
+        _selfieCandidateActive = false;
+        return false;
+    }
 
     if (!_initialized) {
         _filteredX = accelX;
@@ -53,6 +85,7 @@ bool OrientationTracker::update(float accelX, float accelY, float accelZ, uint32
         _filteredZ += alpha * (accelZ - _filteredZ);
     }
 
+    updateSelfie(nowMs);
     const UiOrientation nextCandidate = classify(_filteredX, _filteredY);
     if (nextCandidate == _orientation) {
         _candidate = _orientation;

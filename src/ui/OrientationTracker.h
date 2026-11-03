@@ -20,9 +20,11 @@ public:
     UiOrientation candidate() const { return _candidate; }
     float filteredX() const { return _filteredX; }
     float filteredY() const { return _filteredY; }
+    bool selfie() const { return _available && _selfie; }
 
 private:
     UiOrientation classify(float x, float y) const;
+    void updateSelfie(uint32_t nowMs);
 
     bool _available = true;
     bool _initialized = false;
@@ -34,6 +36,9 @@ private:
     float _filteredZ = 0.0f;
     uint32_t _candidateSinceMs = 0;
     uint32_t _lastCommittedAtMs = 0;
+    bool _selfie = false;
+    bool _selfieCandidateActive = false;
+    uint32_t _selfieCandidateSinceMs = 0;
 };
 
 }  // namespace rvf

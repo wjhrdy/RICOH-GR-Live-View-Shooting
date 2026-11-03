@@ -39,7 +39,7 @@ See the [project architecture](docs/project_overview.md), [BLE protocol notes](d
 - Portrait keeps BLE shutter control available and turns the camera AP off; landscape re-enables the AP, joins Wi-Fi, and starts LiveView.
 - Both GR III and GR IV keep BLE connected during LiveView for deterministic autofocus and shutter operation.
 - Leaving LiveView first attempts HTTP WLAN Finish, disconnects the StickS3 Wi-Fi STA, then turns the camera AP off over BLE.
-- Button B single-click mirror, double-click LiveView Lock, and three-second hold to clear pairing.
+- Build-time automatic top-down/selfie viewfinder; Button B double-click LiveView Lock, and three-second hold to clear pairing.
 - IMU low-pass filtering, hysteresis, and stabilization timing to prevent orientation chatter.
 - 256 KB PSRAM frame buffer, 8192-byte stream buffer, and ESP32-S3-optimized JPEG decoding.
 - Wi-Fi, MJPEG stream, and valid-frame watchdogs with automatic LiveView recovery.
@@ -141,7 +141,7 @@ GR IV Family retains its Legacy security configuration and fixed passkey `123456
 | Button B | Pairing guide | Switch among GR II, GR III, and GR IV |
 | Button A | Camera ready | Trigger one AF + shutter command on press; holding does not repeat it |
 | Button A | Camera sleep guard | Request one safe manual reconnect without taking a picture |
-| Button B single-click | Normal UI | Toggle and persist LiveView image mirroring |
+| Button B single-click | Normal UI | Toggle and persist mirroring when `UI_AUTO_SELFIE=0`; ignored in auto-selfie builds |
 | Button B double-click | LiveView | Toggle LiveView Lock; a locked preview stays active in portrait |
 | Hold Button B for three seconds | Paired state | Clear camera profile, Wi-Fi cache, and BLE bonds, then return to the pairing guide |
 | Hold the power button for about 1.2 seconds | Any state | Power off the StickS3 |
@@ -165,6 +165,18 @@ Holding Button A for more than 300 ms shows focus animation and sound feedback, 
 - BLE stays connected on both GR III and GR IV, so Button A continues to use the BLE AF shutter.
 
 Orientation must remain stable for about 500 ms before switching. If the IMU is unavailable, the firmware falls back to landscape preview mode. With LiveView Lock enabled by a Button B double-click, portrait orientation no longer closes the preview.
+
+### Auto-selfie hot-shoe mode
+
+Build with `-DUI_AUTO_SELFIE=1` to always boot in auto-selfie mode. This flag is enabled in `platformio.ini` and inherited by the camera-specific builds. The screen shows `AUTO TOP` or `AUTO SELFIE`. Saved mirror preferences are ignored and left unchanged; Button B single-click cannot leave this mode. Set the flag to `0` and rebuild to restore the original manual mirror toggle and saved preference.
+
+- Mount the StickS3 in landscape, with the screen face-up when folded flat. Flat mode shows an unmirrored top-down viewfinder at the normal landscape rotation.
+- Hinge the screen upright toward the subject. After the tilt settles, the image mirrors horizontally and the entire display rotates 180°, including the readable UI overlays. Folding it flat restores the original view.
+- The IMU uses the existing low-pass filter, an axis-dominance dead band around the halfway angle, and a 500 ms stable-pose delay (plus filtering time).
+- Auto-selfie keeps LiveView requested in both positions, including at flat startup. It does not require LiveView Lock. With `UI_AUTO_SELFIE=0`, the usual portrait/landscape lifecycle and LiveView Lock behavior apply.
+- If the IMU is unavailable, Auto-selfie falls back to the unmirrored top-down view.
+
+The sensor measures gravity, not the hinge angle. Tilting the whole camera or folding the screen toward the photographer can also trigger selfie mode. This mode assumes a roughly level camera and a hinge that raises the screen toward the subject. Confirm the mounting direction and switching angles on hardware before relying on it; automated tests cannot validate the physical mount.
 
 ## GR III and GR IV Protocol Differences
 

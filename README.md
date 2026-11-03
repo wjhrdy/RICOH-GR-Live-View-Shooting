@@ -39,7 +39,7 @@ GR III/IV 使用 BLE 完成机型识别、配对、WLAN 控制与快门，GR II 
 - 竖持保持 BLE 快门可用并关闭相机 AP；横持重新开启 AP、连接 Wi-Fi 并启动 LiveView。
 - GR III 与 GR IV 在 LiveView 期间都保持 BLE，确保对焦快门路径稳定。
 - 退出 LiveView 时先尝试 HTTP WLAN Finish，再断开 StickS3 Wi-Fi，最后通过 BLE 关闭相机 AP。
-- Button B 单击切换画面镜像、双击锁定 LiveView、长按 3 秒清除配对。
+- 编译期开启自动俯视/自拍取景；Button B 双击锁定 LiveView、长按 3 秒清除配对。
 - IMU 姿态滤波、滞回和稳定时间控制，减少横竖屏临界角度抖动。
 - 256 KB PSRAM 帧缓冲、8192 字节流缓冲和 ESP32-S3 优化 JPEG 解码。
 - Wi-Fi、MJPEG 数据流和有效帧看门狗，LiveView 异常时自动恢复连接。
@@ -141,7 +141,7 @@ GR IV Family 保留原有 Legacy 安全配置和固定 Passkey `123456`。固件
 | Button B | 配对引导 | 在 GR II / GR III / GR IV 之间切换 |
 | Button A | 相机可拍摄 | 按下时触发一次 AF + 快门；持续按住不会重复发送 |
 | Button A | 相机休眠保护 | 请求一次安全的手动重连，不触发拍摄 |
-| Button B 单击 | 正常界面 | 切换并保存 LiveView 画面镜像 |
+| Button B 单击 | 正常界面 | `UI_AUTO_SELFIE=0` 时切换并保存镜像；自动自拍固件中忽略单击 |
 | Button B 双击 | LiveView | 开关 LiveView Lock；锁定后转为竖持仍保持预览 |
 | Button B 长按 3 秒 | 已配对状态 | 清除相机 Profile、Wi-Fi 缓存和 BLE Bonds，然后返回配对引导 |
 | 电源键长按约 1.2 秒 | 任意状态 | 关闭 StickS3 |
@@ -165,6 +165,18 @@ Button A 按住超过 300 ms 会显示对焦动画和声音反馈，但拍摄命
 - BLE 在 GR III 和 GR IV 上都保持连接，Button A 继续走 BLE AF 快门。
 
 设备姿态需要稳定约 500 ms 才切换；如果 IMU 不可用，固件按横屏预览模式运行。双击 B 开启 LiveView Lock 后，预览不再跟随姿态关闭。
+
+### 热靴自动自拍模式
+
+使用 `-DUI_AUTO_SELFIE=1` 编译，每次启动固定进入自动自拍模式。`platformio.ini` 已启用此标志，各机型固件继承该设置；屏幕显示 `AUTO TOP` 或 `AUTO SELFIE`。此时忽略但不修改原有镜像设置，单击 Button B 不会退出该模式。将标志设为 `0` 并重新编译，可恢复原有手动镜像切换及保存的偏好。
+
+- StickS3 横向安装，折平时屏幕朝上：使用正常横屏方向，画面不镜像，便于俯视取景。
+- 将屏幕翻起朝向被摄者，姿态稳定后画面水平镜像，整个屏幕旋转 180°，UI 文字仍正常可读。折平后恢复。
+- 使用现有 IMU 低通滤波、约半程角度附近的滞回区间和 500 ms 稳定判定（另加滤波延迟），避免临界位置频繁切换。
+- 两种姿态及平放启动时均请求 LiveView，无需开启 LiveView Lock。`UI_AUTO_SELFIE=0` 时使用原有横竖屏生命周期和 LiveView Lock 行为。
+- IMU 不可用时回退到不镜像的俯视取景模式。
+
+传感器测量重力方向而非铰链角度，倾斜整个相机或向摄影者方向翻起屏幕也可能触发自拍模式。因此假定相机大致水平、铰链朝被摄者翻起。使用前需在实机确认安装方向和切换角度；自动化测试不能验证实体支架。
 
 ## GR III 与 GR IV 的协议差异
 

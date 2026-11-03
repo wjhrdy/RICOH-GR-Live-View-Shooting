@@ -6,6 +6,7 @@
 #include "ui/UiAnimator.h"
 #include "ui/UiCoordinator.h"
 #include "ui/UiTypes.h"
+#include "ui/ViewfinderMode.h"
 
 class DisplayUi {
 public:
@@ -27,9 +28,11 @@ public:
     void showPasskeyEntry(const uint8_t digits[6], uint8_t activeIndex, uint8_t remainingSec = 0);
     int16_t width() const { return _width; }
     int16_t height() const { return _height; }
-    void setMirrored(bool mirrored);
-    bool toggleMirror();
-    bool mirrored() const { return _mirrored; }
+    void setMirrored(bool mirrored) { _mirrored = mirrored; }
+    bool toggleMirror() { _mirrored = !_mirrored; return _mirrored; }
+    rvf::ViewfinderMode viewfinderMode() const { return rvf::configuredViewfinderMode(_mirrored); }
+    void setSelfiePose(bool selfie) { _selfie = selfie; }
+    bool mirrored() const { return rvf::viewfinderMirrored(viewfinderMode(), _selfie); }
     LovyanGFX* getCanvas() { return _canvasReady ? &_canvas : nullptr; }
     void pushCanvas();
 
@@ -46,6 +49,7 @@ private:
     void drawDisconnected(const rvf::UiViewModel& view);
     void drawError(const rvf::UiViewModel& view);
     void drawBatteryIndicator(const rvf::UiViewModel& view);
+    void drawViewfinderMode();
     void drawShutterOverlay(const rvf::UiViewModel& view);
     void drawCenteredText(const char* text, int16_t y, uint16_t color);
     uint32_t renderIntervalMs(rvf::UiScene scene) const;
@@ -66,4 +70,5 @@ private:
     bool _sceneDrawn = false;
     bool _orientationFailurePending = false;
     bool _mirrored = false;
+    bool _selfie = false;
 };
