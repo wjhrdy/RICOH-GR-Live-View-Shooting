@@ -57,7 +57,17 @@ GR III/IV 使用 BLE 完成机型识别、配对、WLAN 控制与快门，GR II 
 
 ## 安装固件
 
-### 使用 M5Burner
+### 本分支：自动自拍固件
+
+**[下载最新自动自拍固件](https://github.com/wjhrdy/RICOH-GR-Live-View-Shooting/releases/latest)** · **[浏览器安装指南（英文）](docs/install-auto-selfie.md)**
+
+下载 `ricoh-auto-selfie-merged.bin`，使用 Chrome 或 Edge 打开 [Espressif 浏览器烧录工具](https://espressif.github.io/esptool-js/)，以地址 `0x0`、DIO / 80 MHz / 8 MB 烧录，无需安装编译工具。完整镜像会重置相机配对和设置；安装指南也说明了保留设置的应用程序单独升级方式。
+
+每次 PR 构建均在 Actions 中提供可下载的固件包。合并到 `main` 后自动测试并发布 Release。打包步骤检查 `UI_AUTO_SELFIE=1`，并验证包含 `boot_app0` 的完整镜像。首次 Release 将在该工作流合并后生成。
+
+下方 M5Burner 教程安装的是**上游固件**，不包含本分支的自动自拍功能。
+
+### 使用 M5Burner（上游固件）
 
 不需要安装编程环境，也不需要下载源代码。准备一台 StickS3、一根可传输数据的 USB-C 线和 Chrome/Edge 浏览器，然后按下面操作：
 

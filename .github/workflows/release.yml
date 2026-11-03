@@ -2,26 +2,31 @@ name: Firmware Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag to create or update, for example v1.0.0'
+        description: 'Release tag to create or update, for example v4.0.1'
         required: true
         type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: firmware-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   firmware:
-    name: build and publish firmware
+    name: test, build and publish auto-selfie firmware
     runs-on: ubuntu-latest
 
     env:
       PIO_ENV: m5stack-sticks3
-      PROJECT_SLUG: ricoh-gr-live-view-shooting
       REQUESTED_TAG: ${{ github.event.inputs.tag_name || '' }}
 
     steps:
@@ -30,37 +35,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve release tag
+      - name: Resolve release source
         id: release
         shell: bash
         run: |
           set -euo pipefail
 
-          git fetch --tags --force
-
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            TAG_NAME="auto-selfie-${GITHUB_SHA:0:12}"
           else
             TAG_NAME="${REQUESTED_TAG}"
+            if [[ ! "${TAG_NAME}" =~ ^v[0-9]+([.][0-9]+)*([-+][0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Release tags must look like v4.0.1 or v4.0.1-beta.1."
+              exit 1
+            fi
           fi
 
-          if [[ -z "${TAG_NAME}" ]]; then
-            echo "::error::A release tag is required."
-            exit 1
+          if git rev-parse --verify --quiet "refs/tags/${TAG_NAME}" >/dev/null; then
+            git checkout --detach "refs/tags/${TAG_NAME}"
           fi
-
-          if [[ ! "${TAG_NAME}" =~ ^v[0-9]+([.][0-9]+)*([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release tags must look like v1.0.0 or v1.0.0-beta.1."
-            exit 1
-          fi
-
-          if ! git rev-parse --verify --quiet "refs/tags/${TAG_NAME}" >/dev/null; then
-            git tag "${TAG_NAME}"
-            git push origin "refs/tags/${TAG_NAME}"
-          fi
-
-          git checkout --detach "refs/tags/${TAG_NAME}"
-
           echo "tag_name=${TAG_NAME}" >> "${GITHUB_OUTPUT}"
           echo "commit_sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
@@ -81,98 +76,55 @@ jobs:
           cache: 'pip'
 
       - name: Install PlatformIO
+        run: pip install -r .github/requirements.txt
+
+      - name: Test before publishing
         run: |
-          python -m pip install --upgrade pip
-          pip install -r .github/requirements.txt
+          python scripts/check_model_includes.py
+          platformio test -e native -e native-gr2 -e native-gr3 -e native-gr4
+          PLATFORMIO_BUILD_FLAGS=-DUI_AUTO_SELFIE=1 platformio test -e native --filter test_native_ui
 
-      - name: Build firmware
-        run: platformio run -e "${PIO_ENV}"
+      - name: Build and verify auto-selfie installation package
+        run: platformio run -e "${PIO_ENV}" -t package
 
-      - name: Package release assets
-        id: assets
+      - name: Prepare release notes
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
           set -euo pipefail
+          cat > dist/release-notes.md <<EOF
+          Auto-selfie firmware for **M5Stack StickS3**. Boots into automatic top-down/selfie mode.
 
-          TAG_NAME="${{ steps.release.outputs.tag_name }}"
-          BUILD_DIR=".pio/build/${PIO_ENV}"
-          DIST_DIR="dist"
-          PREFIX="${PROJECT_SLUG}-${TAG_NAME}"
+          **Download ricoh-auto-selfie-merged.bin below**, then open [Espressif's browser flasher](https://espressif.github.io/esptool-js/) in Chrome or Edge. Connect the StickS3, select the file, set address **0x0**, mode **DIO**, frequency **80 MHz**, size **8 MB**, and program it.
 
-          mkdir -p "${DIST_DIR}"
+          Installing the combined image replaces settings and camera pairing. Pair again after restarting. For an existing matching partition layout, firmware.bin at 0x10000 preserves settings; leave Erase all unchecked.
 
-          for file in bootloader.bin partitions.bin firmware.bin; do
-            if [[ ! -f "${BUILD_DIR}/${file}" ]]; then
-              echo "::error::Missing ${BUILD_DIR}/${file}"
-              exit 1
-            fi
-          done
+          [Full installation instructions](https://github.com/${GITHUB_REPOSITORY}/blob/${RELEASE_COMMIT}/docs/install-auto-selfie.md)
 
-          cp "${BUILD_DIR}/bootloader.bin" "${DIST_DIR}/${PREFIX}-bootloader.bin"
-          cp "${BUILD_DIR}/partitions.bin" "${DIST_DIR}/${PREFIX}-partitions.bin"
-          cp "${BUILD_DIR}/firmware.bin" "${DIST_DIR}/${PREFIX}-firmware.bin"
-
-          python "${HOME}/.platformio/packages/tool-esptoolpy/esptool.py" \
-            --chip esp32s3 merge_bin \
-            -o "${DIST_DIR}/${PREFIX}-merged.bin" \
-            0x0 "${BUILD_DIR}/bootloader.bin" \
-            0x8000 "${BUILD_DIR}/partitions.bin" \
-            0x10000 "${BUILD_DIR}/firmware.bin"
-
-          zip -j "${DIST_DIR}/${PREFIX}-binaries.zip" \
-            "${DIST_DIR}/${PREFIX}-bootloader.bin" \
-            "${DIST_DIR}/${PREFIX}-partitions.bin" \
-            "${DIST_DIR}/${PREFIX}-firmware.bin" \
-            "${DIST_DIR}/${PREFIX}-merged.bin"
-
-          (
-            cd "${DIST_DIR}"
-            sha256sum "${PREFIX}"-*.bin "${PREFIX}"-*.zip > "${PREFIX}-sha256.txt"
-          )
-
-          cat > "${DIST_DIR}/release-notes.md" <<EOF
-          Automated firmware build for ${TAG_NAME}.
-
-          Board: M5Stack StickS3
-          PlatformIO environment: ${PIO_ENV}
-          Commit: ${{ steps.release.outputs.commit_sha }}
-
-          Assets:
-          - ${PREFIX}-merged.bin: combined image for flashing at 0x0
-          - ${PREFIX}-firmware.bin: application image for flashing at 0x10000
-          - ${PREFIX}-bootloader.bin: bootloader image for flashing at 0x0
-          - ${PREFIX}-partitions.bin: partition table image for flashing at 0x8000
-          - ${PREFIX}-binaries.zip: all binary images in one archive
-          - ${PREFIX}-sha256.txt: SHA-256 checksums
+          - Auto-selfie: **enabled and checked during packaging**
+          - Environment: ${PIO_ENV}
+          - Source: ${RELEASE_COMMIT}
+          - Build metadata: build-info.json; checksums: SHA256SUMS
+          - Merged image includes bootloader, partition table, boot_app0, and app.
           EOF
-
-          echo "prefix=${PREFIX}" >> "${GITHUB_OUTPUT}"
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
           set -euo pipefail
-
-          TAG_NAME="${{ steps.release.outputs.tag_name }}"
-          PREFIX="${{ steps.assets.outputs.prefix }}"
-
-          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
-            gh release edit "${TAG_NAME}" \
-              --title "${TAG_NAME}" \
-              --notes-file dist/release-notes.md
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --title "Auto-selfie ${RELEASE_TAG}" \
+              --notes-file dist/release-notes.md --latest
           else
-            gh release create "${TAG_NAME}" \
-              --title "${TAG_NAME}" \
-              --notes-file dist/release-notes.md
+            gh release create "${RELEASE_TAG}" --target "${RELEASE_COMMIT}" \
+              --title "Auto-selfie ${RELEASE_TAG}" \
+              --notes-file dist/release-notes.md --latest
           fi
-
-          gh release upload "${TAG_NAME}" \
-            "dist/${PREFIX}-bootloader.bin" \
-            "dist/${PREFIX}-partitions.bin" \
-            "dist/${PREFIX}-firmware.bin" \
-            "dist/${PREFIX}-merged.bin" \
-            "dist/${PREFIX}-binaries.zip" \
-            "dist/${PREFIX}-sha256.txt" \
-            --clobber
+          gh release upload "${RELEASE_TAG}" dist/"${PIO_ENV}"/* --clobber

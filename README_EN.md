@@ -57,7 +57,17 @@ The default build uses Arduino, `espressif32@6.12.0`, M5Unified, M5PM1, NimBLE-A
 
 ## Install the Firmware
 
-### M5Burner
+### This fork: auto-selfie firmware
+
+**[Download the latest auto-selfie firmware](https://github.com/wjhrdy/RICOH-GR-Live-View-Shooting/releases/latest)** · **[Browser installation guide](docs/install-auto-selfie.md)**
+
+Download `ricoh-auto-selfie-merged.bin`, open [Espressif's browser flasher](https://espressif.github.io/esptool-js/) in Chrome or Edge, and flash it at `0x0` using DIO / 80 MHz / 8 MB. No build tools are needed. The combined image replaces camera pairing and settings; the guide also explains app-only updates that preserve them.
+
+Every PR build provides downloadable packages under its Actions run. Merges to `main` automatically test and publish a release. Packaging checks that `UI_AUTO_SELFIE=1` and verifies the complete image, including `boot_app0`. The first release appears after this workflow is merged.
+
+The M5Burner instructions below install the **upstream firmware**, which does not include this fork's auto-selfie changes.
+
+### M5Burner (upstream firmware)
 
 No programming tools or source-code download are required. Prepare a StickS3, a USB-C data cable, and Chrome or Edge, then follow these steps:
 

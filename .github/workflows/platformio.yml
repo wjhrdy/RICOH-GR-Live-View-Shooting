@@ -49,9 +49,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install platformio==6.1.18
 
-      - name: Build RicohViewfinder
+      - name: Build and verify auto-selfie installation package
         run: |
-          platformio run -e ${{ matrix.environment }}
+          platformio run -e ${{ matrix.environment }} -t package
+
+      - name: Upload installation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-selfie-${{ matrix.environment }}
+          path: dist/${{ matrix.environment }}/
+          if-no-files-found: error
+          retention-days: 30
 
   native-test:
     name: native tests
@@ -95,3 +103,8 @@ jobs:
           platformio test -e native-gr2
           platformio test -e native-gr3
           platformio test -e native-gr4
+
+      - name: Test UI with auto-selfie enabled
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DUI_AUTO_SELFIE=1
+        run: platformio test -e native --filter test_native_ui
